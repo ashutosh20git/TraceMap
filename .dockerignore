@@ -1,0 +1,9 @@
+**/node_modules
+apps/web
+data
+reports
+.env
+**/__pycache__
+infra
+tests
+*.log

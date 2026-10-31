@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  TrustGate core AWS footprint: raw-evidence and lake S3 buckets, DynamoDB
+  metadata table, SQS work queues with DLQs, Glue catalog database for the
+  Iceberg profile, a private-by-default VPC, and an optional EC2 analysis
+  worker (Docker host for API/worker/reporting/Neo4j) reachable only via SSM.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: trustgate
+    AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z][a-z0-9]{1,10}$"
+  CreateWorker:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true to launch the EC2 worker (the only hourly-billed resource besides its EBS volume).
+  WorkerInstanceType:
+    Type: String
+    Default: m7g.2xlarge
+    Description: 8 vCPU / 32 GiB Graviton. Must match the AMI architecture below.
+  WorkerAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Use .../al2023-ami-kernel-default-x86_64 for x86 instance types.
+  DataVolumeGiB:
+    Type: Number
+    Default: 200
+    MinValue: 50
+    MaxValue: 4000
+    Description: gp3 volume mounted at /data (DuckDB spill, Docker, Neo4j data).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional. When set, creates a monthly cost budget that emails this address.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 50
+  WebOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Browser origin allowed to PUT presigned multipart upload parts to the raw bucket.
+
+Conditions:
+  HasWorker: !Equals [!Ref CreateWorker, "true"]
+  HasBudget: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvName}" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvName}-public-a" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  # Gateway endpoints are free and keep bulk S3/DynamoDB traffic off the internet path.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TrustGate worker - no inbound; access via SSM Session Manager port forwarding
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------- storage
+  # Raw evidence: versioned, Object Lock capable (no default retention, so dev
+  # deletes still work; retention is applied per object when required).
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-raw-${AWS::AccountId}-${AWS::Region}"
+      ObjectLockEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: raw-to-infrequent-access
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET, HEAD]
+            AllowedOrigins: [!Ref WebOrigin, "http://localhost:8000", "http://127.0.0.1:8000"]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+
+  # Lake: canonical Parquet, findings, relationships, snapshots, evidence
+  # bundles, inventories, models, reports, benchmarks.
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-lake-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 3 }
+          # Compaction replaces files; superseded versions only need short retention.
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 14 }
+          - Id: expire-scratch
+            Status: Enabled
+            Prefix: scratch/
+            ExpirationInDays: 3
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt RawBucket.Arn, !Sub "${RawBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  LakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LakeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # Iceberg catalog namespace for the sustained multiwriter profile.
+  LakeDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_${EnvName}"
+        Description: TrustGate canonical tables (Iceberg)
+        LocationUri: !Sub "s3://${LakeBucket}/iceberg/"
+
+  # ---------------------------------------------------------------- metadata
+  # Single table: jobs, leases, incident heads, versions, outbox, upload sessions.
+  MetaTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-${EnvName}-meta"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
+      SSESpecification: { SSEEnabled: true }
+
+  # ---------------------------------------------------------------- queues
+  IngestDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-ingest-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-ingest"
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDlq.Arn
+        maxReceiveCount: 5
+
+  MaintenanceDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-maintenance-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  MaintenanceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-maintenance"
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MaintenanceDlq.Arn
+        maxReceiveCount: 3
+
+  ReportsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-reports-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ReportsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvName}-reports"
+      VisibilityTimeout: 600
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportsDlq.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------------------------------------------- observability
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/${EnvName}"
+      RetentionInDays: 14
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${EnvName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+        # Track gross usage so alerts still fire while promotional credits absorb the bill.
+        CostTypes: { IncludeCredit: false, IncludeRefund: false }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 90, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+  # ---------------------------------------------------------------- compute identity
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-worker-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
+      Policies:
+        - PolicyName: trustgate-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBuckets
+                Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions, s3:ListBucketMultipartUploads, s3:GetBucketLocation]
+                Resource: [!GetAtt RawBucket.Arn, !GetAtt LakeBucket.Arn]
+              # Raw evidence is write-once from the application's point of view: no delete.
+              - Sid: RawEvidenceReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectAttributes
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObjectRetention
+                  - s3:GetObjectRetention
+                Resource: !Sub "${RawBucket.Arn}/*"
+              - Sid: LakeReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectAttributes
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub "${LakeBucket.Arn}/*"
+              - Sid: Metadata
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Resource:
+                  - !GetAtt MetaTable.Arn
+                  - !Sub "${MetaTable.Arn}/index/*"
+                  - !Sub "${MetaTable.Arn}/stream/*"
+              - Sid: Queues
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt IngestQueue.Arn
+                  - !GetAtt MaintenanceQueue.Arn
+                  - !GetAtt ReportsQueue.Arn
+                  - !GetAtt IngestDlq.Arn
+                  - !GetAtt MaintenanceDlq.Arn
+                  - !GetAtt ReportsDlq.Arn
+              - Sid: IcebergCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${ProjectName}_${EnvName}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}_${EnvName}/*"
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "${LogGroup.Arn}:*"
+
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WorkerRole]
+
+  # ---------------------------------------------------------------- compute
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasWorker
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2   # containers on the host need IMDSv2 credentials
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 40, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+          - DeviceName: /dev/sdf
+            Ebs:
+              VolumeSize: !Ref DataVolumeGiB
+              VolumeType: gp3
+              Iops: 3000
+              Throughput: 250
+              Encrypted: true
+              DeleteOnTermination: false
+
+  Worker:
+    Type: AWS::EC2::Instance
+    Condition: HasWorker
+    Properties:
+      ImageId: !Ref WorkerAmi
+      InstanceType: !Ref WorkerInstanceType
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds: [!Ref WorkerSecurityGroup]
+      IamInstanceProfile: !Ref WorkerInstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvName}-worker" }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Mount the data volume (Nitro exposes it as an NVMe disk) at /data.
+          ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+          DATA_DISK=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | grep -v "/dev/$ROOT_DISK" | head -1)
+          blkid "$DATA_DISK" || mkfs.xfs "$DATA_DISK"
+          mkdir -p /data
+          UUID=$(blkid -s UUID -o value "$DATA_DISK")
+          grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /data xfs defaults,nofail 0 2" >> /etc/fstab
+          mount -a
+          mkdir -p /data/docker /data/duckdb-spill /data/neo4j /data/trustgate
+
+          dnf -y install docker git amazon-cloudwatch-agent
+          mkdir -p /etc/docker
+          echo '{"data-root":"/data/docker","log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"3"}}' > /etc/docker/daemon.json
+          systemctl enable --now docker
+
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m)" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          usermod -aG docker ec2-user
+
+          cat > /etc/trustgate.env <<'EOF'
+          TRUSTGATE_PROFILE=aws
+          AWS_REGION=${AWS::Region}
+          TRUSTGATE_RAW_BUCKET=${RawBucket}
+          TRUSTGATE_LAKE_BUCKET=${LakeBucket}
+          TRUSTGATE_META_TABLE=${MetaTable}
+          TRUSTGATE_INGEST_QUEUE_URL=${IngestQueue}
+          TRUSTGATE_MAINTENANCE_QUEUE_URL=${MaintenanceQueue}
+          TRUSTGATE_REPORTS_QUEUE_URL=${ReportsQueue}
+          TRUSTGATE_GLUE_DATABASE=${ProjectName}_${EnvName}
+          TRUSTGATE_LOG_GROUP=${LogGroup}
+          TRUSTGATE_DUCKDB_SPILL_DIR=/data/duckdb-spill
+          TRUSTGATE_NEO4J_DATA_DIR=/data/neo4j
+          EOF
+          chmod 644 /etc/trustgate.env
+
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  RawBucket:
+    Value: !Ref RawBucket
+  LakeBucket:
+    Value: !Ref LakeBucket
+  MetaTable:
+    Value: !Ref MetaTable
+  MetaTableStreamArn:
+    Value: !GetAtt MetaTable.StreamArn
+  IngestQueueUrl:
+    Value: !Ref IngestQueue
+  MaintenanceQueueUrl:
+    Value: !Ref MaintenanceQueue
+  ReportsQueueUrl:
+    Value: !Ref ReportsQueue
+  GlueDatabase:
+    Value: !Ref LakeDatabase
+  LogGroup:
+    Value: !Ref LogGroup
+  WorkerRoleArn:
+    Value: !GetAtt WorkerRole.Arn
+  WorkerInstanceId:
+    Condition: HasWorker
+    Value: !Ref Worker
+  SsmShell:
+    Condition: HasWorker
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${Worker}"
+  Neo4jTunnel:
+    Condition: HasWorker
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${Worker}
+      --document-name AWS-StartPortForwardingSession
+      --parameters portNumber=7687,localPortNumber=7687

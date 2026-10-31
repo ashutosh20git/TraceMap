@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/caseswitcher.tsx","./src/checkspage.tsx","./src/eventlist.tsx","./src/flowchartview.tsx","./src/graphview.tsx","./src/inspector.tsx","./src/reportpanel.tsx","./src/storyview.tsx","./src/timeline.tsx","./src/uploadpage.tsx","./src/api.ts","./src/graphstyle.tsx","./src/main.tsx","./src/uploads.ts","./src/workspace.ts"],"version":"5.6.3"}

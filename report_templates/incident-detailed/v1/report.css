@@ -1,0 +1,79 @@
+/* TrustGate palette: green #04DB7F on white with charcoal #1F1F1F text. */
+@page {
+  size: A4;
+  margin: 26mm 16mm 20mm 16mm;
+  @top-left { content: element(title); vertical-align: bottom; padding-bottom: 4mm; }
+  @top-right { content: element(logo); vertical-align: bottom; padding-bottom: 3mm; }
+  @bottom-left { content: "CONFIDENTIAL"; font: 700 8pt Inter, sans-serif; color: #1F1F1F; letter-spacing: 0.12em;
+    border-top: 2px solid #04DB7F; width: 60%; padding-top: 2mm; vertical-align: top; }
+  @bottom-right { content: "Page " counter(page) " of " counter(pages); font: 8pt Inter, sans-serif; color: #6B7280;
+    border-top: 2px solid #04DB7F; width: 40%; text-align: right; white-space: nowrap; padding-top: 2mm; vertical-align: top; }
+}
+@page :first {
+  @top-left { content: none; }
+  @top-right { content: none; }
+}
+.run-logo { position: running(logo); }
+.run-logo { display: flex; align-items: center; gap: 1.5mm; }
+.run-logo .wm { font: 600 10pt Inter, sans-serif; color: #1F1F1F; }
+.wm b { color: #03A862; font-weight: 800; }
+.cover-mark { display: flex; align-items: center; gap: 3mm; margin-bottom: 18mm; }
+.cover-mark .wm { font: 600 26pt Inter, sans-serif; color: #1F1F1F; letter-spacing: -0.01em; }
+.run-title { position: running(title); font: 8pt Inter, sans-serif; color: #6B7280; }
+
+html { font: 9.5pt/1.45 Inter, "DejaVu Sans", sans-serif; color: #1F1F1F; }
+h1 { font-size: 22pt; line-height: 1.15; margin: 4mm 0 6mm; }
+h2 { font-size: 13pt; margin: 9mm 0 3mm; padding-bottom: 1.5mm; border-bottom: 2px solid #04DB7F; }
+h3 { font-size: 10.5pt; margin: 5mm 0 2mm; }
+h2.break { break-before: page; }
+p { margin: 0 0 2.5mm; }
+.muted { color: #6B7280; }
+.small { font-size: 8.5pt; }
+.lead { font-size: 10.5pt; }
+
+.cover { break-after: page; padding-top: 10mm; }
+.kicker { color: #04A863; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; font-size: 8.5pt; }
+.facts { border-collapse: collapse; width: 100%; margin: 4mm 0 8mm; }
+.facts th { text-align: left; width: 38mm; color: #6B7280; font-weight: 500; padding: 2mm 0; border-bottom: 1px solid #E5E7EB; }
+.facts td { padding: 2mm 0; border-bottom: 1px solid #E5E7EB; }
+.risk { font-size: 16pt; font-weight: 800; color: #1F1F1F; background: #04DB7F; padding: 0 2.5mm; border-radius: 2mm; }
+.note { font-size: 8.5pt; color: #4B5563; background: #F3F4F6; border-left: 3px solid #04DB7F; padding: 3mm 4mm; }
+
+.badge { display: inline-block; font-size: 7.5pt; font-weight: 700; padding: 0.3mm 2mm; border-radius: 3mm;
+  text-transform: uppercase; letter-spacing: 0.04em; background: #E5E7EB; }
+.badge.outline { background: none; border: 1px solid #1F1F1F; }
+.badge.stage { background: #E7FBF2; color: #036B40; }
+.sev-critical { background: #1F1F1F; color: #fff; }
+.sev-high { background: #F97316; color: #fff; }
+.sev-medium { background: #FDE68A; }
+.sev-low { background: #E5E7EB; }
+
+.ai { border: 1px solid #04DB7F; border-radius: 2mm; padding: 3mm 4mm; margin: 4mm 0; background: #F4FEF9; }
+.ai.fallback, .ai.disabled { border-color: #D1D5DB; background: #F9FAFB; }
+.ai-head { font-weight: 700; margin-bottom: 2mm; }
+.ai-head .muted { font-weight: 400; font-size: 8pt; }
+
+.asset { margin: 0; }
+.asset img { width: 100%; }
+
+.step { border: 1px solid #E5E7EB; border-left: 4px solid #04DB7F; border-radius: 1.5mm; padding: 3mm 4mm; margin: 0 0 4mm; }
+.step-head { margin-bottom: 1.5mm; }
+.cid { display: inline-block; background: #1F1F1F; color: #04DB7F; font-weight: 800; padding: 0.3mm 2mm; border-radius: 1mm; margin-right: 1.5mm; }
+.step-title { font-weight: 700; font-size: 10.5pt; margin-right: 1.5mm; }
+.limit { color: #92400E; font-size: 8.5pt; }
+
+.logs { margin-top: 2mm; }
+.log { font: 7pt/1.35 "DejaVu Sans Mono", monospace; background: #111827; color: #E5E7EB; padding: 1.6mm 2.2mm;
+  border-radius: 1mm; margin-bottom: 1mm; white-space: pre-wrap; word-break: break-all; break-inside: avoid; }
+.log .meta { display: block; color: #04DB7F; margin-bottom: 0.6mm; }
+.more { font-size: 8pt; color: #6B7280; }
+.appendix .log { background: #F3F4F6; color: #1F1F1F; }
+.appendix .log .meta { color: #047A48; }
+
+table.grid { border-collapse: collapse; width: 100%; font-size: 8.5pt; }
+table.grid th { background: #1F1F1F; color: #fff; text-align: left; padding: 1.5mm 2mm; font-weight: 600; }
+table.grid td { border-bottom: 1px solid #E5E7EB; padding: 1.5mm 2mm; vertical-align: top; word-break: break-word; }
+table.grid.narrow { width: 70%; }
+table.grid.narrow th { width: 45%; background: #F3F4F6; color: #1F1F1F; border-bottom: 1px solid #E5E7EB; }
+ul { padding-left: 5mm; margin: 0 0 3mm; }
+li { margin-bottom: 1mm; }

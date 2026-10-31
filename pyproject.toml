@@ -1,0 +1,11 @@
+[project]
+name = "trustgate"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["orjson", "pyarrow", "duckdb", "zstandard", "boto3", "pyyaml", "pydantic", "neo4j"]
+
+[project.scripts]
+trustgate = "trustgate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["trustgate*"]

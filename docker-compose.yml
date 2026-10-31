@@ -1,0 +1,30 @@
+# Local reporting stack. The API (uvicorn) runs on the host and talks to Redis on 127.0.0.1:6380.
+services:
+  redis:
+    image: redis:7.4.1-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports: ["127.0.0.1:6380:6379"]
+    volumes: [redis-data:/data]
+
+  bull-board:
+    build: apps/report-queue
+    environment: { REDIS_URL: "redis://redis:6379" }
+    ports: ["127.0.0.1:3001:3001"]
+    depends_on: [redis]
+
+  report-worker:
+    build: { context: ., dockerfile: apps/reporting/Dockerfile }
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      REPORT_CONCURRENCY: "2"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+    volumes:
+      - ./data:/app/data:ro
+      - ./reports:/app/reports
+    depends_on: [redis]
+    mem_limit: 2g
+    cpus: 2
+
+volumes:
+  redis-data:

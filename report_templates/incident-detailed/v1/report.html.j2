@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ cfg.title }} — {{ s.incident.id }}</title>
+<link rel="stylesheet" href="asset://report.css">
+</head>
+<body>
+<div class="run-logo"><svg class="glyph" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#04DB7F" stroke-width="2.2" stroke-linecap="round"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7.2 7.3l3.6 8.5M16.8 7.3l-3.6 8.5M7.5 6h9"/></svg><span class="wm">Trust<b>Gate</b></span></div>
+<div class="run-title">{{ cfg.title }} · {{ s.incident.id }}</div>
+
+<section class="cover">
+  <div class="cover-mark"><svg class="glyph" viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="#04DB7F" stroke-width="2.2" stroke-linecap="round"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7.2 7.3l3.6 8.5M16.8 7.3l-3.6 8.5M7.5 6h9"/></svg><span class="wm">Trust<b>Gate</b></span></div>
+  <div class="kicker">Incident report · CONFIDENTIAL</div>
+  <h1>{{ s.incident.title }}</h1>
+  <table class="facts">
+    <tr><th>Incident</th><td>{{ s.incident.id }} <span class="badge outline">{{ s.incident.status }}</span></td></tr>
+    <tr><th>Risk score</th><td><span class="risk">{{ s.incident.risk }}</span> (explained in section 6)</td></tr>
+    <tr><th>Observed window</th><td>{{ s.incident.first[:19] }} → {{ s.incident.last[:19] }} (device clock)</td></tr>
+    <tr><th>Stages</th><td>{% for st in s.stages %}<span class="badge stage">{{ st }}</span> {% endfor %}</td></tr>
+    <tr><th>Engine findings</th><td>{{ s.steps|length }} findings · {{ s.evidence_total }} evidence records</td></tr>
+    <tr><th>Graph revision</th><td>{{ s.incident.version }} · story {{ s.story_sha256[:16] }}</td></tr>
+    <tr><th>Generated</th><td>{{ s.composed_at }} · report {{ report_id }}</td></tr>
+  </table>
+  <p class="note">This report explains an immutable engine result. Engine findings are rule detections over source
+  records; relationships between findings are labelled with their decision. A candidate incident is a grouping
+  hypothesis, not a verdict.</p>
+</section>
+
+<h2>1. Executive summary</h2>
+<p class="lead">{{ s.summary }}</p>
+
+<div class="ai {{ narrative.status }}">
+  {% if narrative.status == "generated" %}
+    <div class="ai-head">AI-written narrative <span class="badge outline">{{ narrative.model }}</span>
+      <span class="muted">validated against claims {{ s.steps|map(attribute="claim_id")|join(", ") }}</span></div>
+    {% for para in narrative.text.split("\n") if para.strip() %}<p>{{ para }}</p>{% endfor %}
+  {% elif narrative.status == "fallback" %}
+    <div class="ai-head">AI narrative not used</div>
+    <p class="muted">The generated text failed validation ({{ narrative.errors|join("; ") }}). The deterministic summary
+    above is authoritative.</p>
+  {% else %}
+    <div class="ai-head">AI narrative disabled</div>
+    <p class="muted">No language-model narrative was requested for this report.</p>
+  {% endif %}
+</div>
+
+<h2>2. Attack graph</h2>
+<figure class="asset"><img src="asset://graph.svg" alt="incident graph"></figure>
+
+<h2>3. Timeline</h2>
+<figure class="asset"><img src="asset://timeline.svg" alt="incident timeline"></figure>
+
+<h2>4. Attack story, step by step</h2>
+<p class="muted">Each step is one engine finding in time order, followed by the source log lines it is based on.</p>
+{% for st in s.steps %}
+<div class="step">
+  <div class="step-head">
+    <span class="cid">{{ st.claim_id }}</span>
+    <span class="step-title">{{ st.title }}</span>
+    <span class="badge sev-{{ st.severity }}">{{ st.severity }}</span>
+    <span class="badge stage">{{ st.stage }}</span>
+  </div>
+  <p>{{ st.sentence }}</p>
+  <p class="small"><b>ATT&amp;CK:</b> {% for t in st.attack %}{{ t.id }} {{ t.name }}{% if not loop.last %}; {% endif %}{% endfor %}
+    · <b>Decision:</b> engine detection · <b>Rule:</b> {{ st.rule_id }} v{{ st.rule_version }}</p>
+  {% for lim in st.limitations %}<p class="limit">⚠ {{ lim }}</p>{% endfor %}
+  <div class="logs">
+    {% for l in st.logs %}
+    <div class="log"><span class="meta">line {{ "{:,}".format(l.line_no) }} · {{ l.time[:23] }}{% if l.step and l.step not in ("match", "window") %} · step {{ l.step }}{% endif %}</span>{{ l.raw }}</div>
+    {% endfor %}
+    {% if st.logs_omitted %}<div class="more">+ {{ st.logs_omitted }} more records for this step in the evidence appendix / index.</div>{% endif %}
+  </div>
+</div>
+{% endfor %}
+
+<h2>5. Relationships and observed activity</h2>
+{% if s.relationships %}
+<table class="grid">
+  <tr><th>ID</th><th>Between</th><th>Basis</th><th>Decision</th><th>Gap (h)</th><th>Missing evidence</th></tr>
+  {% for r in s.relationships %}
+  <tr><td>{{ r.id }}</td><td>{{ r.from }} → {{ r.to }}</td><td>{{ r.basis }}<br><span class="muted">{{ r.entity }}</span></td>
+      <td>{{ r.decision }}</td><td>{{ r.gap_hours }}</td><td class="small">{{ r.missing|join(", ") }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">No cross-finding relationships passed the linking checks for this incident.</p>{% endif %}
+{% if s.observed %}
+<h3>Observed activity around these entities</h3>
+<ul class="small">{% for o in s.observed[:40] %}<li>{{ o }}</li>{% endfor %}</ul>
+{% if s.observed|length > 40 %}<p class="muted small">+ {{ s.observed|length - 40 }} more observed aggregates in the story JSON.</p>{% endif %}
+{% endif %}
+
+<h2>6. Risk</h2>
+<table class="grid narrow">
+  {% for k, v in s.risk_factors.items() %}<tr><th>{{ k|replace("_", " ") }}</th><td>{{ v }}</td></tr>{% endfor %}
+  <tr><th>total</th><td><b>{{ s.incident.risk }}</b></td></tr>
+</table>
+
+<h2>7. Gaps and limitations</h2>
+<ul>{% for g in s.gaps %}<li>{{ g }}</li>{% endfor %}</ul>
+
+<h2 class="break">Appendix A. Evidence records</h2>
+<p class="muted">{{ s.appendix|length }} of {{ s.evidence_total }} evidence records{% if s.appendix_omitted %}; the remaining
+{{ s.appendix_omitted }} are listed in the machine-readable evidence index delivered with this report{% endif %}.
+Log text is reproduced verbatim as untrusted data.</p>
+<div class="logs appendix">
+{% for a in s.appendix %}<div class="log"><span class="meta">{{ a.claims }} · line {{ "{:,}".format(a.line_no) }} · offset {{ "{:,}".format(a.byte_offset) }} · {{ a.time[:23] }}</span>{{ a.raw }}</div>
+{% endfor %}
+</div>
+
+<h2>Appendix B. Provenance</h2>
+<table class="grid narrow small">
+  {% for k, v in s.provenance.items() %}<tr><th>{{ k|replace("_", " ") }}</th><td>{{ v }}</td></tr>{% endfor %}
+  <tr><th>template</th><td>{{ cfg.template_id }} v{{ cfg.template_version }}</td></tr>
+  <tr><th>story sha256</th><td>{{ s.story_sha256 }}</td></tr>
+</table>
+</body>
+</html>

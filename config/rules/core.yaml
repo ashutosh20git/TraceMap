@@ -1,0 +1,155 @@
+# TrustGate detection rules. Validated by trustgate/detection/rules.py and
+# compiled to DuckDB SQL; adding a rule here needs no code change (B-4).
+#
+# Rules match VENDOR-NEUTRAL fields produced by trustgate/ingest/semantics.py
+# (category, activity, outcome, src_zone/dst_zone, target_account), never a
+# vendor's event IDs or message wording, so they keep working when the log
+# schema or vendor changes (FortiGate, Windows Security, sshd, CEF, ...).
+#
+# type: event      one finding per matching event, or per group_by key and `bucket`
+#       threshold  sliding `window` per group_by key; fires when count / distinct / sum >= value
+#       sequence   ordered steps joined on a per-step `key`, all within `within`
+attack_version: "ATT&CK v16"
+rules:
+  - id: TG-AUTH-001
+    version: 2
+    title: Login brute force from one source
+    type: threshold
+    severity: medium
+    stage: credential-access
+    attack: [{id: T1110.001, name: "Brute Force: Password Guessing"}]
+    where: {category: authentication, activity: login, outcome: failure}
+    group_by: [src_ip]
+    window: 10m
+    threshold: {count: 20}
+
+  - id: TG-AUTH-002
+    version: 2
+    title: Distributed login failures across one /24
+    type: threshold
+    severity: high
+    stage: credential-access
+    attack: [{id: T1110.003, name: "Brute Force: Password Spraying"}]
+    where: {category: authentication, activity: login, outcome: failure, src_zone: external}
+    group_by: [src_net24]
+    window: 6h
+    threshold: {distinct: src_ip, value: 5}
+
+  - id: TG-AUTH-003
+    version: 2
+    title: Successful login after repeated failures for the same account
+    type: sequence
+    severity: critical
+    stage: initial-access
+    attack: [{id: T1110, name: Brute Force}, {id: T1078, name: Valid Accounts}]
+    within: 24h
+    steps:
+      - {name: failures, key: user, min_count: 3, where: {category: authentication, activity: login, outcome: failure}}
+      - {name: success, key: user, where: {category: authentication, activity: login, outcome: success}}
+
+  - id: TG-AUTH-004
+    version: 2
+    title: Successful login from an external network
+    type: event
+    severity: medium
+    stage: initial-access
+    attack: [{id: T1078, name: Valid Accounts}]
+    where: {category: authentication, activity: login, outcome: success, src_zone: external}
+
+  - id: TG-AUTH-005
+    version: 2
+    title: Login outside working hours (00:00-05:59 device-local)
+    type: event
+    severity: medium
+    stage: initial-access
+    attack: [{id: T1078, name: Valid Accounts}]
+    where: {category: authentication, activity: login, outcome: success, local_hour: {between: [0, 5]}}
+
+  - id: TG-PERS-001
+    version: 2
+    title: New privileged or user account created
+    type: event
+    severity: high
+    stage: persistence
+    attack: [{id: T1136.001, name: "Create Account: Local Account"}]
+    where: {category: account_management, activity: create}
+
+  - id: TG-PERS-002
+    version: 2
+    title: Account created, used, then deleted
+    type: sequence
+    severity: critical
+    stage: defense-evasion
+    attack: [{id: T1136.001, name: "Create Account: Local Account"}, {id: T1078, name: Valid Accounts}, {id: T1070, name: Indicator Removal}]
+    within: 2h
+    steps:
+      - {name: create, key: target_account, where: {category: account_management, activity: create}}
+      - {name: login, key: user, where: {category: authentication, activity: login, outcome: success}}
+      - {name: delete, key: target_account, where: {category: account_management, activity: delete}}
+
+  - id: TG-EVAS-001
+    version: 2
+    title: Logging disabled or logs cleared
+    type: event
+    severity: high
+    stage: defense-evasion
+    attack: [{id: T1562.002, name: "Impair Defenses: Disable Windows Event Logging"}, {id: T1070.001, name: "Indicator Removal: Clear Windows Event Logs"}]
+    where: {category: configuration, activity: [disable_logging, clear_logs]}
+
+  - id: TG-EVAS-002
+    version: 2
+    title: Firewall policy or rules purged
+    type: event
+    severity: critical
+    stage: defense-evasion
+    attack: [{id: T1562.004, name: "Impair Defenses: Disable or Modify System Firewall"}]
+    where: {category: configuration, activity: delete_policy}
+
+  - id: TG-EVAS-003
+    version: 2
+    title: Logging disabled, configuration changed, logging re-enabled
+    type: sequence
+    severity: critical
+    stage: defense-evasion
+    attack: [{id: T1562.002, name: "Impair Defenses"}, {id: T1070, name: Indicator Removal}]
+    within: 12h
+    steps:
+      - {name: log_off, key: user, where: {category: configuration, activity: disable_logging}}
+      - {name: change, key: user, where: {category: configuration, activity: [modify, delete_policy]}}
+      - {name: log_on, key: user, where: {category: configuration, activity: enable_logging}}
+
+  - id: TG-VPN-001
+    version: 2
+    title: Remote-access sessions for one account from multiple countries
+    type: threshold
+    severity: high
+    stage: initial-access
+    attack: [{id: T1078, name: Valid Accounts}, {id: T1133, name: External Remote Services}]
+    where: {category: vpn, activity: login, outcome: success}
+    group_by: [user]
+    window: 2h
+    threshold: {distinct: src_country, value: 2}
+
+  - id: TG-LAT-001
+    version: 2
+    title: Internal host fanning out over SMB to many servers
+    type: threshold
+    severity: high
+    stage: lateral-movement
+    attack: [{id: T1021.002, name: "Remote Services: SMB/Windows Admin Shares"}]
+    where: {category: network, dst_port: 445, src_zone: internal, dst_zone: [internal, dmz]}
+    group_by: [src_ip]
+    window: 24h
+    threshold: {distinct: dst_ip, value: 5}
+
+  - id: TG-WEB-001
+    version: 2
+    title: Repeated inbound exploit attempts against one internal-facing server
+    type: threshold
+    severity: high
+    stage: initial-access
+    attack: [{id: T1190, name: Exploit Public-Facing Application}]
+    where: {category: intrusion, src_zone: external, dst_zone: [dmz, internal]}
+    group_by: [src_ip, dst_ip]
+    window: 1h
+    threshold: {count: 10}

@@ -1,0 +1,13 @@
+{
+  "name": "trustgate-report-queue",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@bull-board/api": "6.5.3",
+    "@bull-board/express": "6.5.3",
+    "bullmq": "5.34.0",
+    "express": "4.21.2"
+  }
+}
