@@ -69,7 +69,7 @@ def run(tmp_path, lines, name):
 @pytest.mark.parametrize("schema", list(SCHEMAS))
 def test_same_attack_same_detections_in_every_schema(tmp_path, schema):
     make = SCHEMAS[schema]
-    lines = [make(i, False) for i in range(25)] + [make(30, True)]
+    lines = [make(i, False) for i in range(25)] + [make(30, True)]  # 25 failures in ~4 min, then success
     m, rows = run(tmp_path, lines, schema)
     assert m["accounting"]["balanced"]
     rules = {r[0] for r in rows}

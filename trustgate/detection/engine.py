@@ -11,7 +11,7 @@ import json
 
 import duckdb
 
-from .rules import Rule, RuleSet, field_sql, interval_sql, where_sql
+from .rules import Rule, RuleSet, field_sql, interval_sql, required_categories, where_sql
 
 STALL_MIN_EVENTS = 1000  # one exact timestamp shared by this many events = stalled/clamped clock
 
@@ -94,6 +94,25 @@ def evidence_sql(rule: Rule, params: list) -> str:
                s.peak::DOUBLE AS metric, b.src_ip, b.dst_ip, b.user
         FROM spans s JOIN base b ON {on} AND b.event_time BETWEEN s.s0 AND s.s1"""
 
+    if rule.type == "periodic":
+        # beaconing: per key and time bucket, many events at near-constant intervals (low coefficient of variation)
+        exprs, sel, kcols, kjson = _keys(rule)
+        base = _base(sel, rule.where, exprs, params)
+        part = ", ".join(kcols)
+        b = interval_sql(rule.bucket)
+        p = rule.periodic
+        return f"""
+        WITH base AS ({base}),
+        g AS (SELECT *, time_bucket({b}, event_time) AS bk,
+                     epoch(event_time - lag(event_time) OVER (PARTITION BY {part}, time_bucket({b}, event_time)
+                                                              ORDER BY event_time, line_no)) AS gap FROM base),
+        stats AS (SELECT {part}, bk, count(*) AS n, avg(gap) AS mean_gap, stddev_pop(gap) AS sd_gap FROM g GROUP BY ALL
+                  HAVING count(*) >= {int(p.min_count)} AND avg(gap) >= epoch({interval_sql(p.min_interval)})
+                     AND stddev_pop(gap) / avg(gap) <= {float(p.max_cv)})
+        SELECT {kjson('s.')} || '|' || s.bk::VARCHAR AS fkey, {kjson('s.')} AS keys, g.event_uid, g.event_time,
+               'beacon' AS step, s.n::DOUBLE AS metric, g.src_ip, g.dst_ip, g.user
+        FROM stats s JOIN g ON {' AND '.join(f'g.{k} = s.{k}' for k in kcols)} AND g.bk = s.bk"""
+
     # sequence: steps joined on equal key values, ordered in time, all within `within`
     w = interval_sql(rule.within)
     ctes, n = [], len(rule.steps)
@@ -123,26 +142,48 @@ def evidence_sql(rule: Rule, params: list) -> str:
     FROM ev_steps e JOIN allb a ON a.event_uid = e.uid"""
 
 
-def run(ruleset: RuleSet, events_glob, out: str, con=None, log=print, region="ap-south-1") -> dict:
+def run(ruleset: RuleSet, events_glob, out: str, con=None, log=print, region="ap-south-1", time_from: str | None = None) -> dict:
+    """time_from: only events at or after this time (incremental runs: new batch plus rule lookback)."""
     con = con or connect()
     if "s3://" in str(events_glob) or out.startswith("s3://"):
         _enable_s3(con, region)
-    con.execute(f"CREATE OR REPLACE VIEW ev AS SELECT * REPLACE (event_time::TIMESTAMPTZ AS event_time) FROM read_parquet({parquet_src(events_glob)}, union_by_name=true)")
+    con.execute(f"CREATE OR REPLACE VIEW ev AS SELECT * REPLACE (event_time::TIMESTAMPTZ AS event_time) FROM read_parquet({parquet_src(events_glob)}, union_by_name=true)"
+                + (f" WHERE event_time::TIMESTAMPTZ >= TIMESTAMPTZ '{time_from}'" if time_from else ""))
     con.execute(f"""CREATE OR REPLACE TEMP TABLE stalls AS SELECT event_time FROM ev GROUP BY 1
                     HAVING count(*) >= {STALL_MIN_EVENTS}""")
     con.execute("CREATE OR REPLACE TEMP TABLE evidence (rule_id VARCHAR, fkey VARCHAR, keys VARCHAR, event_uid VARCHAR, "
                 "event_time TIMESTAMPTZ, step VARCHAR, metric DOUBLE, src_ip VARCHAR, dst_ip VARCHAR, user VARCHAR)")
-    summary = {}
+    summary, status = {}, {}
+    present = {r[0] for r in con.execute("SELECT DISTINCT category FROM ev").fetchall()}
+    try:  # raw field names in the data: one row per distinct field layout is enough
+        fields = {r[0] for r in con.execute(
+            "SELECT DISTINCT unnest(map_keys(a)) FROM (SELECT any_value(attrs) AS a FROM ev GROUP BY schema_fp)").fetchall()}
+    except duckdb.Error:  # data parsed before layouts were fingerprinted
+        fields = {r[0] for r in con.execute("SELECT DISTINCT unnest(map_keys(attrs)) FROM (SELECT attrs FROM ev LIMIT 200000)").fetchall()}
     for rule in ruleset.rules:
         if not rule.enabled:
             continue
+        need = required_categories(rule)
+        if need is not None and not (need & present):  # the data has no events this rule could ever match
+            status[rule.id] = {"status": "not_applicable", "findings": 0, "needs": sorted(need)}
+            continue
+        if rule.requires_fields and not (set(rule.requires_fields) & fields):  # reads fields this data does not have
+            status[rule.id] = {"status": "not_applicable", "findings": 0, "needs": rule.requires_fields[:5]}
+            continue
         params: list = []
-        sql = evidence_sql(rule, params)
         t0 = dt.datetime.now()
-        con.execute(f"INSERT INTO evidence SELECT '{rule.id}', * FROM ({sql})", params)
+        try:
+            sql = evidence_sql(rule, params)
+            con.execute(f"INSERT INTO evidence SELECT '{rule.id}', * FROM ({sql})", params)
+        except duckdb.Error as e:  # one broken rule (e.g. an imported regex) must not stop the others
+            status[rule.id] = {"status": "error", "findings": 0, "error": str(e).splitlines()[0][:200]}
+            log(f"  {rule.id:<12}   error  {str(e).splitlines()[0][:120]}")
+            continue
         n = con.execute(f"SELECT count(DISTINCT fkey) FROM evidence WHERE rule_id = '{rule.id}'").fetchall()[0][0]
         summary[rule.id] = n
-        log(f"  {rule.id:<12} {n:>7} findings  {(dt.datetime.now() - t0).total_seconds():.1f}s  {rule.title}")
+        status[rule.id] = {"status": "fired" if n else "no_match", "findings": n}
+        if n or len(ruleset.rules) <= 60:
+            log(f"  {rule.id:<12} {n:>7} findings  {(dt.datetime.now() - t0).total_seconds():.1f}s  {rule.title}")
 
     meta = [(r.id, r.version, r.fingerprint, r.title, r.severity, r.stage, r.type,
              json.dumps([t.model_dump() for t in r.attack])) for r in ruleset.rules if r.enabled]
@@ -156,9 +197,9 @@ def run(ruleset: RuleSet, events_glob, out: str, con=None, log=print, region="ap
            m.attack, any_value(e.keys) AS keys,
            min(e.event_time) AS first_time, max(e.event_time) AS last_time,
            count(DISTINCT e.event_uid) AS event_count, max(e.metric) AS metric,
-           list_distinct(list(e.src_ip) FILTER (e.src_ip IS NOT NULL))[1:25] AS src_ips,
-           list_distinct(list(e.dst_ip) FILTER (e.dst_ip IS NOT NULL))[1:25] AS dst_ips,
-           list_distinct(list(e.user) FILTER (e.user IS NOT NULL))[1:25] AS users,
+           list_sort(list_distinct(list(e.src_ip) FILTER (e.src_ip IS NOT NULL)))[1:25] AS src_ips,
+           list_sort(list_distinct(list(e.dst_ip) FILTER (e.dst_ip IS NOT NULL)))[1:25] AS dst_ips,
+           list_sort(list_distinct(list(e.user) FILTER (e.user IS NOT NULL)))[1:25] AS users,
            count(DISTINCT e.src_ip) AS src_ip_count, count(DISTINCT e.dst_ip) AS dst_ip_count,
            count(DISTINCT e.user) AS user_count,
            avg(CASE WHEN s.event_time IS NULL THEN 0 ELSE 1 END) AS stall_fraction,
@@ -178,4 +219,27 @@ def run(ruleset: RuleSet, events_glob, out: str, con=None, log=print, region="ap
         os.makedirs(out, exist_ok=True)
     con.execute(f"COPY findings TO '{out}/findings.parquet' (FORMAT parquet, COMPRESSION zstd)")
     con.execute(f"COPY finding_evidence TO '{out}/finding_evidence.parquet' (FORMAT parquet, COMPRESSION zstd)")
-    return {"ruleset_fingerprint": ruleset.fingerprint, "attack_version": ruleset.attack_version, "findings": summary}
+    import json as _json
+    with (open if not out.startswith("s3://") else _s3_open)(f"{out}/rule_status.json", "w") as fh:
+        fh.write(_json.dumps(status))
+    return {"ruleset_fingerprint": ruleset.fingerprint, "attack_version": ruleset.attack_version, "findings": summary,
+            "rule_status": status}
+
+
+class _s3_open:
+    """Minimal text writer to S3 for small JSON artifacts."""
+
+    def __init__(self, uri, mode="w"):
+        self.uri, self.buf = uri, []
+
+    def __enter__(self):
+        return self
+
+    def write(self, s):
+        self.buf.append(s)
+
+    def __exit__(self, *a):
+        import boto3
+        b, k = self.uri[5:].split("/", 1)
+        import os
+        boto3.client("s3", region_name=os.environ.get("AWS_REGION", "ap-south-1")).put_object(Bucket=b, Key=k, Body="".join(self.buf).encode())

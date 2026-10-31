@@ -36,15 +36,16 @@ rules:
     threshold: {distinct: src_ip, value: 5}
 
   - id: TG-AUTH-003
-    version: 2
-    title: Successful login after repeated failures for the same account
+    version: 3
+    title: Successful login after a burst of failures for the same account
     type: sequence
     severity: critical
     stage: initial-access
     attack: [{id: T1110, name: Brute Force}, {id: T1078, name: Valid Accounts}]
-    within: 24h
+    # 10+ failures within an hour before the success: a few typos then a login is normal, a burst is not
+    within: 1h
     steps:
-      - {name: failures, key: user, min_count: 3, where: {category: authentication, activity: login, outcome: failure}}
+      - {name: failures, key: user, min_count: 10, where: {category: authentication, activity: login, outcome: failure}}
       - {name: success, key: user, where: {category: authentication, activity: login, outcome: success}}
 
   - id: TG-AUTH-004

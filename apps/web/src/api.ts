@@ -16,6 +16,9 @@ export type IncidentSummary = {
   degraded_clock: boolean;
   version: string;
   sources: { source_id: string; filename: string }[];
+  first_rev?: number;
+  change?: "new" | "grew" | "merged";
+  change_rev?: number;
 };
 
 export type GNode = { id: string; type: "finding" | "ip" | "user" | "device"; label: string; data: Record<string, any> };

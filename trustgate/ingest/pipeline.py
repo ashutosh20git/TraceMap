@@ -122,7 +122,13 @@ def _chunk_inference(data: bytes, parser, primary: str, head_keys: set, inferred
     """Schema drift inside a file: if this chunk's records use field names never seen
     in the file head, infer mappings from those records too (head mappings win)."""
     drifted = []
-    for line in data[: 4 << 20].split(b"\n")[:2000]:
+    n = len(data)
+    for k in range(2000):  # sample lines evenly across the whole chunk, not just its start
+        s = data.find(b"\n", k * n // 2000) + 1 if k else 0
+        e = data.find(b"\n", s)
+        if s <= 0 and k or s >= n:
+            continue
+        line = data[s: e if e >= 0 else n]
         try:
             f, _ = parse_any(line.rstrip(b"\r"), parser, primary)
         except Exception:

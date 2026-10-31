@@ -91,6 +91,7 @@ def _index(snap):
     s = {"snap": snap}
     s["findings"] = {f["id"]: f for f in snap["findings"]}
     s["ips"] = {i["addr"]: i for i in snap["ips"]}
+    s["users"] = {u["name"]: u for u in snap.get("users", [])}
     s["hubs"] = {h["value"]: h["degree"] for h in snap.get("hubs", [])}
     s["involves"] = defaultdict(list)
     for r in snap["involves"]:
@@ -126,6 +127,7 @@ def summary():
             "entities_users": len(s["snap"]["users"]), "findings_by_rule": by_rule,
             "bundle_events": len(s["events"]), "graph_version": s["snap"]["incidents"][0]["version"] if s["incidents"] else None,
             "revision": s["snap"].get("revision"), "sources": s["snap"].get("sources", []),
+            "growth": s["snap"].get("growth", []),
             "empty": not s["snap"]["incidents"] and not s["snap"]["findings"]}
 
 
@@ -136,6 +138,7 @@ def incidents():
     for i in s["snap"]["incidents"]:
         fs = [s["findings"][f] for f in i["finding_ids"]]
         out.append({k: i[k] for k in ("id", "status", "first", "last", "stages", "rules", "max_severity", "risk", "version")}
+                   | {k: i.get(k) for k in ("first_rev", "change", "change_rev")}
                    | {"title": _title(i, s), "risk_factors": json.loads(i["risk_factors"]), "finding_count": len(fs),
                       "event_count": sum(f["event_count"] for f in fs),
                       "degraded_clock": any(f["time_reliability"] != "ok" for f in fs),
@@ -148,7 +151,8 @@ def _node(kind, key, s, role=None):
         ip = s["ips"].get(key, {"addr": key})
         return {"id": f"ip:{key}", "type": "ip", "label": key, "data": ip | {"hub_degree": s["hubs"].get(key, 0)}}
     if kind == "user":
-        return {"id": f"u:{key}", "type": "user", "label": key, "data": {"name": key, "hub_degree": s["hubs"].get(key, 0)}}
+        return {"id": f"u:{key}", "type": "user", "label": key,
+                "data": {"name": key, "hub_degree": s["hubs"].get(key, 0), "first_rev": s["users"].get(key, {}).get("first_rev")}}
     return {"id": f"d:{key}", "type": "device", "label": key, "data": {"name": key}}
 
 
@@ -174,7 +178,8 @@ def incident(inc_id: str):
             n = _node(r["kind"], r["value"], s)
             nodes.setdefault(n["id"], n)
             edges.append({"id": f"inv:{fid}:{n['id']}:{r['role']}", "source": f"f:{fid}", "target": n["id"],
-                          "type": "INVOLVES", "label": r["role"], "data": {"role": r["role"], "decision": "engine_detection"}})
+                          "type": "INVOLVES", "label": r["role"],
+                          "data": {"role": r["role"], "decision": "engine_detection", "first_rev": f.get("first_rev")}})
     ent = {k for k in nodes if not k.startswith("f:")}
     for l in s["snap"]["links"]:
         if l["a"] in fids and l["b"] in fids:
@@ -221,6 +226,37 @@ def findings(rule_id: str | None = None, limit: int = Query(100, le=1000), offse
     fs = [f for f in store()["snap"]["findings"] if not rule_id or f["rule_id"] == rule_id]
     fs.sort(key=lambda f: f["first"])
     return {"total": len(fs), "items": fs[offset:offset + limit]}
+
+
+@lru_cache(maxsize=1)
+def _ruleset():
+    from ..detection.rules import load_rules
+    return load_rules(str(ROOT / "config" / "rules"))
+
+
+@app.get("/api/coverage")
+def coverage():
+    """Every rule under the 14 ATT&CK tactics, with its status on this case's data."""
+    from ..detection.rules import TACTICS
+    rs = _ruleset()
+    status = store()["snap"].get("rule_status", {})
+    cols = {t: [] for t in TACTICS + ["unmapped"]}
+    for r in rs.rules:
+        st = status.get(r.id, {"status": "not_run", "findings": 0})
+        item = {"id": r.id, "title": r.title, "severity": r.severity, "type": r.type, "stage": r.stage,
+                "attack": [t.model_dump() for t in r.attack], "source": (r.source or {}).get("kind", "native"),
+                "status": st["status"], "findings": st.get("findings", 0), "error": st.get("error"), "needs": st.get("needs")}
+        for t in (r.tactics or [r.stage]):
+            cols.setdefault(t, []).append(item)
+    order = {"fired": 0, "no_match": 1, "error": 2, "not_applicable": 3, "not_run": 4}
+    out = []
+    for t, items in cols.items():
+        items.sort(key=lambda i: (order.get(i["status"], 9), i["source"] != "native", i["id"]))
+        out.append({"tactic": t, "rules": items, "total": len(items),
+                    "applicable": sum(i["status"] in ("fired", "no_match") for i in items),
+                    "fired": sum(i["status"] == "fired" for i in items)})
+    return {"tactics": out, "rules": len(rs.rules), "native": sum(not r.source for r in rs.rules),
+            "imported": sum(bool(r.source) for r in rs.rules), "analyzed": bool(status)}
 
 
 @app.get("/api/rules")
@@ -478,6 +514,23 @@ def create_case(req: CaseRequest):
     cid = (_re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:28] or "case") + "-" + state.new_id("c")[-4:]
     state.put_case(cid, name)
     return {"case_id": cid, "name": name}
+
+
+@app.delete("/api/cases/{case_id}")
+def delete_case(case_id: str):
+    import shutil
+    from ..service import state
+    if case_id == "default":
+        raise HTTPException(400, "the first case cannot be deleted")
+    try:
+        out = state.delete_case(case_id)
+    except ValueError:
+        raise HTTPException(400, "invalid case id")
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    shutil.rmtree(ROOT / "data" / "snapshots" / case_id, ignore_errors=True)
+    _cases.pop(case_id, None)
+    return out
 
 
 _dist = ROOT / "apps" / "web" / "dist"

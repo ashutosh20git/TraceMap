@@ -1,0 +1,133 @@
+# Rules derived from ATT&CK tactics not covered by core.yaml. Vendor-neutral fields only.
+attack_version: "ATT&CK v16"
+rules:
+  - id: TG-RECON-001
+    version: 1
+    title: Port scan from an external source
+    type: threshold
+    severity: medium
+    stage: reconnaissance
+    attack: [{id: T1595.001, name: "Active Scanning: Scanning IP Blocks"}]
+    where: {category: [network, intrusion], src_zone: external, dst_zone: [internal, dmz]}
+    group_by: [src_ip, dst_ip]
+    window: 10m
+    threshold: {distinct: dst_port, value: 20}
+
+  - id: TG-RECON-002
+    version: 1
+    title: Host sweep from an external source
+    type: threshold
+    severity: medium
+    stage: reconnaissance
+    attack: [{id: T1595.001, name: "Active Scanning: Scanning IP Blocks"}]
+    where: {category: [network, intrusion], src_zone: external, dst_zone: [internal, dmz]}
+    group_by: [src_ip]
+    window: 10m
+    threshold: {distinct: dst_ip, value: 30}
+
+  - id: TG-EXEC-001
+    version: 1
+    title: Encoded or hidden PowerShell command line
+    type: event
+    severity: high
+    stage: execution
+    attack: [{id: T1059.001, name: "Command and Scripting Interpreter: PowerShell"}, {id: T1027, name: Obfuscated Files or Information}]
+    where:
+      category: process
+      any:
+        - {attr.CommandLine: {icontains: [" -enc ", " -encodedcommand ", " -e JAB", "frombase64string", " -w hidden"]}}
+        - {attr.process.command_line: {icontains: [" -enc ", " -encodedcommand ", " -e JAB", "frombase64string", " -w hidden"]}}
+        - {message: {icontains: [" -encodedcommand ", "frombase64string"]}}
+
+  - id: TG-PRIV-001
+    version: 1
+    title: Account added to a privileged group
+    type: event
+    severity: high
+    stage: privilege-escalation
+    attack: [{id: T1098, name: Account Manipulation}, {id: T1078.002, name: "Valid Accounts: Domain Accounts"}]
+    where: {category: account_management, activity: group_add}
+
+  - id: TG-DISC-001
+    version: 1
+    title: Internal host sweeping many internal addresses
+    type: threshold
+    severity: medium
+    stage: discovery
+    attack: [{id: T1046, name: Network Service Discovery}, {id: T1018, name: Remote System Discovery}]
+    where: {category: network, src_zone: internal, dst_zone: [internal, dmz]}
+    group_by: [src_ip]
+    window: 10m
+    threshold: {distinct: dst_ip, value: 25}
+
+  - id: TG-DISC-002
+    version: 1
+    title: Internal port scan of one host
+    type: threshold
+    severity: medium
+    stage: discovery
+    attack: [{id: T1046, name: Network Service Discovery}]
+    where: {category: network, src_zone: internal, dst_zone: [internal, dmz]}
+    group_by: [src_ip, dst_ip]
+    window: 10m
+    threshold: {distinct: dst_port, value: 20}
+
+  - id: TG-COLL-001
+    version: 1
+    title: Large data pull from internal servers by one host
+    type: threshold
+    severity: medium
+    stage: collection
+    attack: [{id: T1039, name: Data from Network Shared Drive}]
+    where: {category: network, src_zone: internal, dst_zone: [internal, dmz]}
+    group_by: [src_ip]
+    window: 1h
+    threshold: {sum: bytes_in, value: 500000000}
+
+  - id: TG-C2-001
+    version: 1
+    title: Regular beaconing to one external destination
+    type: periodic
+    severity: high
+    stage: command-and-control
+    attack: [{id: T1071, name: Application Layer Protocol}, {id: T1029, name: Scheduled Transfer}]
+    where: {category: network, src_zone: internal, dst_zone: external}
+    group_by: [src_ip, dst_ip]
+    bucket: 1d
+    periodic: {min_count: 12, max_cv: 0.1, min_interval: 30s}
+
+  - id: TG-EXFIL-001
+    version: 1
+    title: Large outbound transfer from one host
+    type: threshold
+    severity: high
+    stage: exfiltration
+    attack: [{id: T1048, name: Exfiltration Over Alternative Protocol}, {id: T1041, name: Exfiltration Over C2 Channel}]
+    where: {category: network, src_zone: internal, dst_zone: external}
+    group_by: [src_ip]
+    window: 1h
+    threshold: {sum: bytes_out, value: 2000000000}
+
+  - id: TG-IMP-001
+    version: 1
+    title: Burst of account deletions on one system
+    type: threshold
+    severity: high
+    stage: impact
+    attack: [{id: T1531, name: Account Access Removal}]
+    where: {category: account_management, activity: delete}
+    group_by: [device]
+    window: 10m
+    threshold: {count: 10}
+
+  - id: TG-IMP-002
+    version: 1
+    title: Several services stopped on one device
+    type: threshold
+    severity: high
+    stage: impact
+    attack: [{id: T1489, name: Service Stop}]
+    where: {category: system, activity: service_stop}
+    group_by: [device]
+    window: 10m
+    threshold: {count: 5}

@@ -61,14 +61,14 @@ SCHEMA = pa.schema([
 # Windows Security (incl. winlog.event_data.*), CEF, LEEF, Zeek, Palo Alto, Cisco/ASA-style and web logs.
 ALIASES = {
     "device": ["devname", "observer.name", "observer.hostname", "host.name", "host.hostname", "agent.hostname", "dvchost",
-               "deviceHostName", "Computer", "computer_name", "winlog.computer_name", "DeviceName", "syslog_host", "hostname_device"],
+               "deviceHostName", "Computer", "computer_name", "winlog.computer_name", "DeviceName", "device", "host", "syslog_host", "hostname_device"],
     "event_type": ["type", "event.category", "cat", "category", "event_type", "EventType", "log_type"],
     "event_subtype": ["subtype", "event.type", "event_subtype", "SubType", "subtype_name"],
     "event_code": ["logid", "event.code", "EventID", "EventId", "event_id", "winlog.event_id", "signature_id", "eventid", "msg_id"],
     "severity": ["level", "severity", "event.severity", "log.level", "sev", "Severity", "priority"],
     "action": ["action", "act", "event.action", "Action", "disposition"],
     "outcome": ["status", "event.outcome", "outcome", "result", "Status", "auth_result"],
-    "user": ["user", "user.name", "TargetUserName", "winlog.event_data.TargetUserName", "suser", "usrName", "username",
+    "user": ["user", "user.name", "TargetUserName", "winlog.event_data.TargetUserName", "SubjectUserName", "suser", "usrName", "username",
              "user_name", "UserName", "account", "AccountName", "login", "duser", "dstuser", "srcuser", "src_user"],
     "src_ip": ["srcip", "source.ip", "src", "src_ip", "src_addr", "SourceAddress", "IpAddress", "winlog.event_data.IpAddress",
                "client.ip", "client_ip", "clientip", "c-ip", "remote_addr", "remote_ip", "sourceAddress", "id.orig_h", "remip"],
@@ -195,9 +195,25 @@ def _tokens(key: str):
 
 
 def infer_mapping(samples: list[dict]) -> dict:
-    """For canonical fields that no known alias covers in this source, pick the
-    most plausible unknown key using its name tokens and the shape of its values.
-    Returns {canonical: {"key": k, "confidence": c, "evidence": "..."}}."""
+    """Per field layout (records with the same set of field names), pick the most plausible unknown
+    key for each canonical field that layout's known aliases do not cover. A file can mix layouts
+    (firewall flows and Windows events), so "covered" is decided per layout, never for the file.
+    Returns {canonical: {"key": first key, "keys": [one per layout that needed it], "confidence", "evidence"}}."""
+    groups = {}
+    for x in samples:
+        groups.setdefault(frozenset(x), []).append(x)
+    out = {}
+    for layout in sorted(groups.values(), key=len, reverse=True)[:50]:
+        if len(layout) < 3:
+            continue
+        for col, m in _infer_layout(layout).items():
+            cur = out.setdefault(col, {**m, "keys": []})
+            if m["key"] not in cur["keys"]:
+                cur["keys"].append(m["key"])
+    return out
+
+
+def _infer_layout(samples: list[dict]) -> dict:
     if not samples:
         return {}
     keys = {}
@@ -261,9 +277,10 @@ class BatchBuilder:
         self.cols = {name: [] for name in SCHEMA.names}
         inferred = inferred or {}
         # known aliases first; an inferred key is only consulted when none of them is present
-        self.aliases = {c: al + ([inferred[c]["key"]] if c in inferred else []) for c, al in ALIASES.items()}
-        self.time_keys = TIME_KEYS + ([inferred["event_time"]["key"]] if "event_time" in inferred else [])
-        self.mapped = MAPPED | {v["key"] for v in inferred.values()}
+        keys_of = lambda c: inferred[c].get("keys") or [inferred[c]["key"]] if c in inferred else []
+        self.aliases = {c: al + [k for k in keys_of(c) if k not in al] for c, al in ALIASES.items()}
+        self.time_keys = TIME_KEYS + keys_of("event_time")
+        self.mapped = MAPPED | {k for c in inferred for k in keys_of(c)}
         self.schemas = {}  # schema fingerprint -> [count, sorted keys]
         self._plans = {}   # field-name layout -> cached column mapping plan
         self.unmapped = 0

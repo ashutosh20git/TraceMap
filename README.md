@@ -99,3 +99,31 @@ python -m uvicorn trustgate.api.app:app --port 8000
 - **Provenance:** every incident lists the files its evidence came from. Incidents with more than one are marked "spans N files", and flowchart cards show their file. The Checks page lists how the files relate (shared device, overlapping time).
 - **Connections across cases** are never merged automatically; a shared IP or account is context, not proof.
 - **Reports** pin the case and revision when requested (`data/snapshots/<case>/rev-N.json`), so a later revision never changes an existing report.
+
+## Incremental knowledge base (batches arriving over time)
+
+Each new file in a case (for example the next 5 GB export) becomes one **revision**. It is parsed alone and then joined to everything already known (`trustgate/kb/incremental.py`):
+
+- **Detection:** reads only the new batch plus a lookback equal to the longest rule window, extended back to the start of any detection that is still open. A brute force that starts in one file and ends in the next keeps its detection ID and fires once, with all its events. Late events move the lookback back to cover them. A changed rule set triggers a full recompute.
+- **Knowledge base:** stored in `findings/ws=<case>/rev-N/kb/`:
+  - `entities.parquet`: tracked IPs and accounts, with first/last seen, counts and `first_rev`;
+  - `edges.parquet`: login, flow and config-change relationships, with count, interval, evidence and `first_rev`;
+  - `sources.parquet`: per-file time range and devices.
+
+  New files are scanned for all tracked entities. Older files are scanned only for entities that became tracked in this revision, so every event is counted exactly once.
+- **Graph and incidents:** built from the knowledge base and merged into Neo4j. Every node, edge, detection and incident carries the revision it first appeared in. An incident is marked **grew** when it ties earlier detections to new data, or when one of its detections continued into the new batch.
+- **Seeing it:**
+  - the Checks page has a "How the knowledge base grew" panel with per-revision totals and additions;
+  - the entity graph has a revision slider and **Replay growth**, where new nodes get a green ring and new links animate;
+  - incidents show "grew in rev N".
+- **Proof:** `tests/test_incremental.py` processes 4 batches whose boundaries cut through attacks. It asserts the result equals one full run, including relationship counts, and that the cross-batch incident is marked as grown.
+- **Demo:** `python scripts/make_synthetic.py out.jsonl key.md <batch-dir>` writes 4 batch files. `python scripts/stream_batches.py "<case>" <batch files...>` uploads and processes them one at a time through the API.
+- **Entity index per file:** after parsing, each source gets `canonical/source=<id>/entity_index.parquet`, a sorted list of every IP and account with the segment files that mention it (`trustgate/kb/index.py`; `python -m trustgate.cli index <glob>...` for files parsed earlier). When an entity first becomes relevant, its history is read only from those segments, not from every older file. Files without an index fall back to a full scan. Tracked entities are never dropped, so history is never counted twice.
+- **Deleting a case:** the "Delete" button in the top bar, or `DELETE /api/cases/<id>`, removes its records, published snapshots, detections, knowledge base, parsed events and uploaded files (every stored version). It is refused while a run is in progress; the first case cannot be deleted.
+
+## Detection rules and ATT&CK coverage
+
+- **TrustGate rules: 24** (`config/rules/core.yaml`, `tactics.yaml`). They cover 13 of the 14 ATT&CK tactics, using vendor-neutral fields only. Resource development leaves no trace in host or network logs. Rule types: `event`, `threshold`, `sequence` and `periodic` (beaconing: regular intervals, low variation). `tests/test_scenarios.py` requires every rule to fire exactly on its planted synthetic scenario and nowhere else.
+- **Sigma rules: 3,289** imported from SigmaHQ `r2026-07-01` (`trustgate/detection/sigma.py`, `scripts/sigma_import.py`). Supported: the full condition grammar (and/or/not, parentheses, `1 of`/`all of`, `them`) and the modifiers contains, startswith, endswith, all, re, cidr, windash, exists and gt/lt, plus wildcards. Aggregation and correlation rules, base64/utf16 transforms and field references are skipped with a reason (13 rules). Free-text keyword rules (68) are imported disabled, because they would match any product's logs. Newer ATT&CK tags Stealth and Defense Impairment are shown under Defense Evasion.
+- **Applicability:** a rule is *not applicable* when the data has none of the event categories or raw fields it needs, so it is skipped without scanning. This keeps 3,313 rules fast. Each rule's status (fired / no match / not applicable / error) is merged across revisions, shown on the **Rules & coverage** page (14 tactic columns), and served by `/api/coverage`.
+- **Mixed-layout files:** field inference runs per field layout, so a file mixing firewall flows and renamed Windows events maps each layout's own time, account and address fields.

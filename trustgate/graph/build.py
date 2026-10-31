@@ -35,7 +35,10 @@ def _rows(con, sql, params=None):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def build(events_glob, findings_dir: str, con=None, region="ap-south-1", max_flows_per_ip=50) -> dict:
+def build(events_glob, findings_dir: str, con=None, region="ap-south-1", max_flows_per_ip=50,
+          kb: dict | None = None, prev: dict | None = None, rev: int = 1, bundle_from: str | None = None) -> dict:
+    """kb: observed nodes/edges from the knowledge base (incremental runs skip the corpus scan).
+    prev: the previous revision's snapshot, to reuse evidence rows and carry first-seen revisions."""
     con = con or connect()
     if "s3://" in str(events_glob) + findings_dir:
         _enable_s3(con, region)
@@ -55,6 +58,8 @@ def build(events_glob, findings_dir: str, con=None, region="ap-south-1", max_flo
     con.execute("""CREATE OR REPLACE TEMP TABLE ent_user AS SELECT DISTINCT value AS u FROM fent
                    WHERE kind='user' AND role='account'""")
 
+    if kb is not None:
+        return _finish(con, kb["ips"], kb["auth"], kb["flows"], kb["configured"], prev, rev, bundle_from)
     # one bounded scan of the corpus for everything the graph needs about these entities
     con.execute("""CREATE OR REPLACE TEMP TABLE sub AS
         SELECT event_uid, event_time, event_type, event_subtype, event_code, action, outcome, user, src_ip, dst_ip,
@@ -95,7 +100,12 @@ def build(events_glob, findings_dir: str, con=None, region="ap-south-1", max_flo
     configured = _rows(con, """
         SELECT user, coalesce(device, 'unknown') AS device, action, message, event_time::VARCHAR AS time, event_uid, src_ip
         FROM sub WHERE category IN ('configuration', 'account_management') AND user IS NOT NULL""")
-    findings = _rows(con, """SELECT finding_id AS id, rule_id, rule_version, title, severity, stage, attack, keys,
+    return _finish(con, ip_nodes, auth, flows, configured, prev, rev, bundle_from)
+
+
+def _finish(con, ip_nodes, auth, flows, configured, prev, rev, bundle_from):
+    user_nodes = _rows(con, "SELECT DISTINCT value AS name FROM fent WHERE kind='user'")
+    findings = _rows(con,"""SELECT finding_id AS id, rule_id, rule_version, title, severity, stage, attack, keys,
                              first_time::VARCHAR AS first, last_time::VARCHAR AS last, event_count, metric,
                              time_reliability, stall_fraction, provenance FROM f""")
     involves = _rows(con, "SELECT DISTINCT finding_id, kind, value, role FROM fent")
@@ -137,18 +147,72 @@ def build(events_glob, findings_dir: str, con=None, region="ap-south-1", max_flo
     if inc_fids:
         con.execute("CREATE OR REPLACE TEMP TABLE inc_fe AS SELECT * FROM fe WHERE finding_id IN (SELECT unnest(?::VARCHAR[]))",
                     [inc_fids])
-        bundle = _rows(con, """
+        need = {r["event_uid"] for r in _rows(con, "SELECT DISTINCT event_uid FROM inc_fe")}
+        reuse = [e for e in (prev or {}).get("bundle", []) if e["uid"] in need]  # rows from the previous revision
+        have = {e["uid"] for e in reuse}
+        con.execute("CREATE OR REPLACE TEMP TABLE have_uid AS SELECT unnest(?::VARCHAR[]) AS uid", [sorted(have) or [""]])
+        sql = """
             SELECT e.event_uid AS uid, e.event_time::VARCHAR AS time, e.time_quality, e.event_type, e.event_subtype,
                    e.event_code, e.severity, e.action, e.outcome, e.user, e.src_ip, e.dst_ip, e.dst_port, e.protocol,
                    e.rule_name, e.message, e.bytes_out, e.bytes_in, e.src_zone AS src_role,
                    e.dst_zone AS dst_role, e.src_country, e.category, e.activity,
-                   e.line_no, e.byte_offset, e.byte_length, e.source_id, e.raw,
-                   list(DISTINCT x.finding_id) AS finding_ids, list(DISTINCT x.step) AS steps
-            FROM ev e JOIN inc_fe x ON x.event_uid = e.event_uid
-            GROUP BY ALL ORDER BY time""")
-    return {"ips": ip_nodes, "users": user_nodes, "auth": auth, "flows": flows, "configured": configured,
-            "findings": findings, "involves": involves, "links": links, "incidents": incidents,
-            "hubs": [{"value": k, "degree": v} for k, v in hubs.items()], "bundle": bundle}
+                   e.line_no, e.byte_offset, e.byte_length, e.source_id, e.raw
+            FROM ev e WHERE e.event_uid IN (SELECT event_uid FROM inc_fe) AND e.event_uid NOT IN (SELECT uid FROM have_uid) {cond}"""
+        fetched = _rows(con, sql.format(cond=f"AND e.event_time >= TIMESTAMPTZ '{bundle_from}'" if bundle_from else ""))
+        if bundle_from and len(have) + len(fetched) < len(need):  # an older detection newly joined an incident
+            con.execute("CREATE OR REPLACE TEMP TABLE have_uid AS SELECT unnest(?::VARCHAR[]) AS uid",
+                        [sorted(have | {e["uid"] for e in fetched}) or [""]])
+            fetched += _rows(con, sql.format(cond=""))
+        links_of = {}
+        for r in _rows(con, "SELECT event_uid, list(DISTINCT finding_id) AS f, list(DISTINCT step) AS s FROM inc_fe GROUP BY 1"):
+            links_of[r["event_uid"]] = (r["f"], r["s"])
+        for e in reuse + fetched:
+            e["finding_ids"], e["steps"] = links_of[e["uid"]]
+        bundle = sorted(reuse + fetched, key=lambda e: e["time"])
+    graph = {"ips": ip_nodes, "users": user_nodes, "auth": auth, "flows": flows, "configured": configured,
+             "findings": findings, "involves": involves, "links": links, "incidents": incidents,
+             "hubs": [{"value": k, "degree": v} for k, v in hubs.items()], "bundle": bundle}
+    annotate_revisions(graph, prev, rev)
+    return graph
+
+
+def annotate_revisions(graph: dict, prev: dict | None, rev: int):
+    """Stamp everything with the revision it first appeared in, and mark incidents that are new
+    or grew in this revision, so the UI can replay how the graph grew batch by batch."""
+    prev = prev or {}
+    first = {}
+    for kind, items, key in (("finding", prev.get("findings", []), "id"), ("ip", prev.get("ips", []), "addr"),
+                             ("user", prev.get("users", []), "name")):
+        for x in items:
+            first[(kind, x[key])] = x.get("first_rev", 1)
+    for x in prev.get("links", []):
+        first[("link", x["a"], x["b"], x["basis"], x["entity"])] = x.get("first_rev", 1)
+    for kind, items, key in (("finding", graph["findings"], "id"), ("ip", graph["ips"], "addr"), ("user", graph["users"], "name")):
+        for x in items:
+            x.setdefault("first_rev", first.get((kind, x[key]), rev) if not x.get("first_rev") else x["first_rev"])
+    for x in graph["links"]:
+        x["first_rev"] = first.get(("link", x["a"], x["b"], x["basis"], x["entity"]), rev)
+    for name in ("auth", "flows", "configured"):
+        for x in graph[name]:
+            x.setdefault("first_rev", rev)
+    prev_inc = [(set(i["finding_ids"]), i) for i in prev.get("incidents", [])]
+    prev_count = {f["id"]: f.get("event_count") for f in prev.get("findings", [])}
+    frev = {f["id"]: f["first_rev"] for f in graph["findings"]}
+    fcount = {f["id"]: f.get("event_count") for f in graph["findings"]}
+    for inc in graph["incidents"]:
+        cur = set(inc["finding_ids"])
+        olds = [i for s, i in prev_inc if s & cur]
+        revs = [frev.get(x, rev) for x in cur]
+        inc["first_rev"] = min(revs + [i.get("first_rev", 1) for i in olds])
+        # a detection that continued into the new batch (same id, more events) also makes its incident grow
+        extended = any(x in prev_count and prev_count[x] != fcount[x] for x in cur)
+        if len(olds) == 1 and set(olds[0]["finding_ids"]) == cur and not extended:
+            inc["change"], inc["change_rev"] = olds[0].get("change", "new"), olds[0].get("change_rev", inc["first_rev"])
+        elif not olds and min(revs) == rev:
+            inc["change"], inc["change_rev"] = "new", rev
+        else:  # ties detections from earlier batches to this batch's data
+            inc["change"], inc["change_rev"] = ("merged" if len(olds) > 1 else "grew"), rev
+    graph["revision"] = rev
 
 
 def _candidate_incidents(findings, links):
@@ -198,10 +262,10 @@ CONSTRAINTS = [
 ]
 LOADS = {
     "ips": "UNWIND $rows AS r MERGE (n:IP {addr: r.addr}) SET n += r",
-    "users": "UNWIND $rows AS r MERGE (:User {name: r.name})",
+    "users": "UNWIND $rows AS r MERGE (u:User {name: r.name}) SET u.first_rev = coalesce(u.first_rev, r.first_rev)",
     "findings": """UNWIND $rows AS r MERGE (f:Finding {id: r.id})
         SET f += r {.rule_id, .title, .severity, .stage, .keys, .first, .last, .event_count, .metric,
-                    .time_reliability, .stall_fraction, .provenance, .attack}
+                    .time_reliability, .stall_fraction, .provenance, .attack, .first_rev}
         MERGE (ru:Rule {id: r.rule_id}) SET ru.version = r.rule_version, ru.title = r.title
         MERGE (f)-[:DETECTED_BY]->(ru)
         WITH f, r UNWIND r.techniques AS t
@@ -222,7 +286,7 @@ LOADS = {
         MERGE (a)-[l:RELATED {basis: r.basis, entity: r.entity}]->(b)
         SET l += r {.decision, .gap_s, .claim, .checks, .missing, .version}""",
     "incidents": """UNWIND $rows AS r MERGE (i:Incident {id: r.id})
-        SET i += r {.status, .first, .last, .stages, .rules, .max_severity, .risk, .risk_factors, .version}
+        SET i += r {.status, .first, .last, .stages, .rules, .max_severity, .risk, .risk_factors, .version, .first_rev, .change, .change_rev}
         WITH i, r UNWIND r.finding_ids AS fid MATCH (f:Finding {id: fid}) MERGE (i)-[:CONTAINS]->(f)""",
 }
 
@@ -236,6 +300,7 @@ def load(graph: dict, uri: str, user: str, password: str, reset=True, batch=2000
             s.run("MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS")
         for c in CONSTRAINTS:
             s.run(c)
+        s.run("MATCH (i:Incident) DETACH DELETE i")  # incidents are recomputed every revision
         for name in ("ips", "users", "findings", "involves", "auth", "flows", "configured", "links", "incidents"):
             rows = graph[name]
             for i in range(0, len(rows), batch):

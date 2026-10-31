@@ -179,3 +179,38 @@ def release_lock(owner: str):
                             ExpressionAttributeNames={"#o": "owner"}, ExpressionAttributeValues={":o": owner})
     except table().meta.client.exceptions.ConditionalCheckFailedException:
         pass
+
+
+# ---------------------------------------------------------------- case deletion
+def delete_case(case_id: str) -> dict:
+    """Remove a case: its metadata items, published snapshots, detections, knowledge base, parsed events
+    and raw uploads (every stored version). Refused while a run is in progress."""
+    import boto3
+    use_case(case_id)
+    run = latest_run()
+    if run and run.get("status") == "running":
+        raise RuntimeError("a processing run is still in progress for this case")
+    t = table()
+    sources = list_sources()
+    items = [(f"SOURCE#{s['source_id']}", "META") for s in sources]
+    r = t.query(IndexName="gsi1", KeyConditionExpression=Key("gsi1pk").eq(f"WS#{case_id}#RUNS"))
+    items += [(i["pk"], i["sk"]) for i in r.get("Items", [])]
+    items += [(f"WS#{case_id}", "HEAD"), (f"WS#{case_id}", "LOCK"), (f"CASE#{case_id}", "META")]
+    with t.batch_writer() as w:
+        for pk, sk in items:
+            w.delete_item(Key={"pk": pk, "sk": sk})
+    s3 = boto3.resource("s3", region_name=_env("AWS_REGION"))
+    lake, raw = s3.Bucket(_env("TRUSTGATE_LAKE_BUCKET")), s3.Bucket(_env("TRUSTGATE_RAW_BUCKET"))
+    removed = 0
+    prefixes = [(lake, f"findings/ws={case_id}/"), (lake, f"graph/ws={case_id}/")]
+    for s in sources:
+        prefixes.append((lake, f"canonical/source={s['source_id']}/"))
+        if s.get("key", "").startswith(f"sources/{s['source_id']}/"):  # only files uploaded into this case
+            prefixes.append((raw, f"sources/{s['source_id']}/"))
+    for bucket, prefix in prefixes:
+        for page in bucket.object_versions.filter(Prefix=prefix).pages(): # versioned buckets: remove every version
+            keys = [{"Key": v.object_key, "VersionId": v.id} for v in page]
+            if keys:
+                bucket.delete_objects(Delete={"Objects": keys, "Quiet": True})
+                removed += len(keys)
+    return {"case_id": case_id, "sources": len(sources), "records": len(items), "objects": removed}

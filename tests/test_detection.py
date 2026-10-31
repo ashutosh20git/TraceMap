@@ -42,7 +42,8 @@ def findings(tmp_path_factory):
     lines += [fail(i * 20, "45.0.0.1") for i in range(25)]             # 25 in ~8 min -> brute force
     lines += [fail(3600 + i * 20, "45.0.0.2") for i in range(19)]      # 19 -> below threshold
     lines += [fail(7200 + i * 60, f"50.41.253.{i}") for i in range(6)]  # 6 IPs, one /24 -> spray
-    lines += [fail(9000 + i, "9.9.9.9", "keerthan") for i in range(3)] + [ok(9100, "35.1.1.1", "keerthan")]
+    lines += [fail(9000 + i, "9.9.9.9", "keerthan") for i in range(10)] + [ok(9100, "35.1.1.1", "keerthan")]
+    lines += [fail(9200 + i, "9.9.9.7", "typo") for i in range(3)] + [ok(9300, "10.1.1.1", "typo")]  # normal typos: no finding
     lines += [ok(9200, "9.9.9.8", "lonely")]                            # success without failures: no TG-AUTH-003
     lines += [conf(10000, "laxman", "Add system.admin svc_b", "0100044547"), ok(10300, "105.1.1.1", "svc_b"),
               conf(10600, "laxman", "Delete system.admin svc_b", "0100044547")]

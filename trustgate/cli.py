@@ -16,7 +16,7 @@ def main(argv=None):
     det = sub.add_parser("detect", help="Run YAML rules over canonical Parquet")
     det.add_argument("events", help="events glob, e.g. s3://lake/canonical/source=x/events/*.parquet")
     det.add_argument("out", help="findings output dir (local or s3://)")
-    det.add_argument("--rules", nargs="+", default=["config/rules/core.yaml"])
+    det.add_argument("--rules", nargs="+", default=["config/rules"])
     det.add_argument("--temp-dir")
     gr = sub.add_parser("graph", help="Build the relationship graph and load Neo4j")
     gr.add_argument("events")
@@ -25,7 +25,19 @@ def main(argv=None):
     gr.add_argument("--neo4j-uri", default=os.environ.get("NEO4J_URI", "bolt://localhost:7687"))
     gr.add_argument("--neo4j-user", default=os.environ.get("NEO4J_USER", "neo4j"))
     gr.add_argument("--no-load", action="store_true", help="build and snapshot only")
+    ix = sub.add_parser("index", help="Build the entity index for parsed sources (history lookups read only matching segments)")
+    ix.add_argument("events", nargs="+", help="events glob(s), e.g. s3://lake/canonical/source=<id>/events/*.parquet")
     args = ap.parse_args(argv)
+
+    if args.cmd == "index":
+        from .detection import engine
+        from .kb.index import build_entity_index
+        con = engine.connect(temp_dir="/data/duckdb-spill" if os.path.isdir("/data/duckdb-spill") else None)
+        if any(g.startswith("s3://") for g in args.events):
+            engine._enable_s3(con, os.environ.get("AWS_REGION", "ap-south-1"))
+        for g in args.events:
+            print(build_entity_index(con, g), flush=True)
+        return 0
 
     if args.cmd == "detect":
         from .detection import engine

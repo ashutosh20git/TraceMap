@@ -10,6 +10,20 @@ export default function CaseSwitcher({ onChanged }: { onChanged: () => void }) {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const current = (cases.data ?? []).find((c) => c.case_id === caseState.id);
+
+  const remove = async () => {
+    setBusy(true);
+    setError(null);
+    const r = await fetch(`/api/cases/${encodeURIComponent(caseState.id)}`, { method: "DELETE" });
+    setBusy(false);
+    if (!r.ok) return setError((await r.json().catch(() => ({}))).detail ?? "Could not delete the case.");
+    setConfirming(false);
+    await qc.invalidateQueries({ queryKey: ["cases"] });
+    pick("default");
+  };
 
   const pick = (id: string) => {
     setCase(id);
@@ -29,6 +43,18 @@ export default function CaseSwitcher({ onChanged }: { onChanged: () => void }) {
     pick(c.case_id);
   };
 
+  if (confirming) {
+    return (
+      <div className="caseform" role="alertdialog" aria-label="Confirm case deletion">
+        <span className="small">
+          Delete <b>{current?.name ?? caseState.id}</b> with its uploaded files, results and reports? This cannot be undone.
+        </span>
+        <button className="btn danger" onClick={remove} disabled={busy}>{busy ? "Deleting…" : "Delete case"}</button>
+        <button className="btn ghost" onClick={() => setConfirming(false)} disabled={busy}>Cancel</button>
+        {error && <span className="error small">{error}</span>}
+      </div>
+    );
+  }
   if (adding) {
     return (
       <form className="caseform" onSubmit={create}>
@@ -48,6 +74,9 @@ export default function CaseSwitcher({ onChanged }: { onChanged: () => void }) {
         ))}
       </select>
       <button className="btn ghost" onClick={() => setAdding(true)}>New case</button>
+      {caseState.id !== "default" && (
+        <button className="btn ghost muted" onClick={() => setConfirming(true)} title="Delete this case">Delete</button>
+      )}
     </div>
   );
 }

@@ -12,9 +12,10 @@ import UploadPage from "./UploadPage";
 import ChecksPage from "./ChecksPage";
 import { useRun } from "./workspace";
 import CaseSwitcher from "./CaseSwitcher";
+import CoveragePage from "./CoveragePage";
 
 export type Selection = { kind: "node" | "edge" | "event"; id: string } | null;
-type Page = "upload" | "checks" | "investigate";
+type Page = "upload" | "checks" | "investigate" | "coverage";
 type Tab = "story" | "flow" | "graph" | "timeline";
 
 /** Which events and graph nodes a selection lights up, so graph, timeline and list stay in sync. */
@@ -53,7 +54,7 @@ function highlight(sel: Selection, d: IncidentDetail | undefined) {
 
 const readHash = (): Page | null => {
   const h = location.hash.slice(1);
-  return h === "upload" || h === "checks" || h === "investigate" ? h : null;
+  return h === "upload" || h === "checks" || h === "investigate" || h === "coverage" ? h : null;
 };
 
 export default function App() {
@@ -106,6 +107,7 @@ export default function App() {
             </span>
           ))}
         </nav>
+        <button className={`btn ghost navlink ${current === "coverage" ? "on" : ""}`} onClick={() => go("coverage")}>Rules & coverage</button>
         <div className="ws num">
           {published ? (
             <>
@@ -119,6 +121,7 @@ export default function App() {
         </div>
       </header>
       <div className="content" key={caseVersion}>
+        {!summary.isLoading && current === "coverage" && <CoveragePage />}
         {!summary.isLoading && current === "upload" && <UploadPage onStarted={() => go("checks")} />}
         {!summary.isLoading && current === "checks" && <ChecksPage published={published} onOpenBoard={() => go("investigate")} />}
         {summary.isLoading && <div className="page"><div className="panel empty">Loading the workspace…</div></div>}
@@ -170,6 +173,11 @@ function Investigate() {
               {i.first.slice(5, 16).replace("T", " ")} → {i.last.slice(5, 16).replace("T", " ")} · {i.finding_count} detection{i.finding_count > 1 ? "s" : ""}
               {i.degraded_clock ? " · clock stall" : ""}
             </span>
+            {i.change_rev != null && i.change_rev > 1 && (
+              <span className={`tag ${i.change === "new" ? "state-ok" : "state-warn"}`}>
+                {i.change === "new" ? "new" : i.change === "merged" ? "merged" : "grew"} in rev {i.change_rev}
+              </span>
+            )}
             {i.sources.length > 1 && <span className="tag state-warn" title={i.sources.map((x) => x.filename).join(", ")}>spans {i.sources.length} files</span>}
           </button>
         ))}

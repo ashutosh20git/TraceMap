@@ -1,0 +1,67 @@
+{
+ "release": "r2026-07-01",
+ "files": 3303,
+ "imported": 3289,
+ "skipped": 13,
+ "skip_reasons": {
+  "modifier base64offset not supported": 8,
+  "duplicate id": 3,
+  "modifier fieldref not supported": 2
+ },
+ "skip_examples": {
+  "modifier base64offset not supported": "rules-emerging-threats/2025/Exploits/CVE-2025-53770/proc_creation_win_exploit_cve_2025_53770_indicators.yml",
+  "duplicate id": "rules-emerging-threats/2025/Malware/Atomic-MacOS-Stealer/proc_creation_macos_malware_amos_curl_post.yml",
+  "modifier fieldref not supported": "rules/cloud/aws/cloudtrail/aws_update_login_profile.yml"
+ },
+ "imported_by_level": {
+  "critical": 175,
+  "high": 1706,
+  "medium": 1408
+ },
+ "imported_by_tactic": {
+  "defense-evasion": 1330,
+  "execution": 952,
+  "persistence": 774,
+  "privilege-escalation": 695,
+  "credential-access": 338,
+  "initial-access": 317,
+  "command-and-control": 284,
+  "discovery": 180,
+  "lateral-movement": 145,
+  "impact": 140,
+  "collection": 92,
+  "exfiltration": 65,
+  "resource-development": 34,
+  "reconnaissance": 25,
+  "unmapped": 1
+ },
+ "imported_by_product": {
+  "windows": 2543,
+  "linux": 183,
+  "-": 158,
+  "azure": 123,
+  "macos": 51,
+  "aws": 41,
+  "gcp": 25,
+  "opencanary": 24,
+  "zeek": 21,
+  "okta": 20,
+  "m365": 18,
+  "rpc_firewall": 17,
+  "cisco": 12,
+  "bitbucket": 12,
+  "github": 9,
+  "kubernetes": 9,
+  "fortigate": 7,
+  "jvm": 5,
+  "paloalto": 2,
+  "spring": 2,
+  "fortios": 1,
+  "django": 1,
+  "nodejs": 1,
+  "python": 1,
+  "ruby_on_rails": 1,
+  "sql": 1,
+  "velocity": 1
+ }
+}

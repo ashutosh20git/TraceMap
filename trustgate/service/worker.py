@@ -23,7 +23,7 @@ import boto3
 from . import state
 
 IDLE_STOP_MIN = int(os.environ.get("TRUSTGATE_IDLE_STOP_MIN", "30"))
-RULES = os.environ.get("TRUSTGATE_RULES", "config/rules/core.yaml")
+RULES = os.environ.get("TRUSTGATE_RULES", "config/rules")
 
 
 def _sqs():
@@ -86,6 +86,12 @@ def handle_ingest(msg):
             state.update_source(sid, status="duplicate", duplicate_of=dup["source_id"], content_sha256=m["stored_sha256"],
                                 summary=json.dumps(summary))
         else:
+            from ..detection import engine as _engine
+            from ..kb.index import build_entity_index
+            _step(rid, f"ingest:{sid}", "running", filename=src["filename"], note="indexing entities")
+            con = _engine.connect(temp_dir="/data/duckdb-spill" if os.path.isdir("/data/duckdb-spill") else None)
+            _engine._enable_s3(con, state._env("AWS_REGION"))
+            build_entity_index(con, f"s3://{_lake()}/canonical/source={sid}/events/*.parquet")
             state.update_source(sid, status="ingested", content_sha256=m["stored_sha256"], summary=json.dumps(summary),
                                 ingested_at=state.now())
         _step(rid, f"ingest:{sid}", "done", filename=src["filename"], duplicate_of=dup["source_id"] if dup else None,
@@ -134,27 +140,44 @@ def handle_analyze(msg, receipt):
             return True
         ids = [s["source_id"] for s in srcs]
         head = state.get_head()
-        if head and sorted(head["sources"]) == sorted(ids):  # coalesced: data already published
-            state.update_run(rid, status="published", revision=head["revision"], finished_at=state.now(),
-                             note="no new data since the published revision")
-            return True
+        rules = load_rules(RULES)
+        if head and sorted(head["sources"]) == sorted(ids):
+            import json as _j
+            published = _j.loads(boto3.client("s3", region_name=state._env("AWS_REGION"))
+                                 .get_object(Bucket=_lake(), Key=head["snapshot_key"])["Body"].read()).get("ruleset")
+            if published == rules.fingerprint:  # coalesced: same data, same rules, already published
+                state.update_run(rid, status="published", revision=head["revision"], finished_at=state.now(),
+                                 note="no new data or rule changes since the published revision")
+                return True
         rev = (head["revision"] if head else 0) + 1
-        globs = [f"s3://{_lake()}/canonical/source={i}/events/*.parquet" for i in ids]
-        fdir = f"s3://{_lake()}/findings/ws={state.ws()}/rev-{rev}"
-        _step(rid, "detect", "running")
+        from ..kb.incremental import analyze
+        globs = {i: f"s3://{_lake()}/canonical/source={i}/events/*.parquet" for i in ids}
+        new_ids = [i for i in ids if not head or i not in head["sources"]]
+        base = f"s3://{_lake()}/findings/ws={state.ws()}/rev-{rev}"
+        prev = None
+        if head:  # the published revision is the knowledge base this batch is joined to
+            import json as _json
+            snap = _json.loads(boto3.client("s3", region_name=state._env("AWS_REGION"))
+                               .get_object(Bucket=_lake(), Key=head["snapshot_key"])["Body"].read())
+            prev = {"base": f"s3://{_lake()}/findings/ws={state.ws()}/rev-{head['revision']}", "snapshot": snap,
+                    "ruleset": snap.get("ruleset")}
+        _step(rid, "detect", "running", note=f"{len(new_ids)} new file(s) joined to revision {head['revision']}" if head else None)
         con = engine.connect(temp_dir="/data/duckdb-spill" if os.path.isdir("/data/duckdb-spill") else None)
-        res = engine.run(load_rules(RULES), globs, fdir, con=con, log=lambda s: print(s, flush=True))
-        _step(rid, "detect", "done", findings=sum(res["findings"].values()))
+        engine._enable_s3(con, state._env("AWS_REGION"))
+        graph = analyze(con, rules, globs, new_ids, {s["source_id"]: s["filename"] for s in srcs}, rev, base,
+                        prev=prev, log=lambda s: print(s, flush=True))
+        grow = graph["growth"][-1]
+        _step(rid, "detect", "done", findings=len(graph["findings"]), note=f"{grow['mode']}; {grow['detections_new']} new detections")
         _step(rid, "graph", "running")
-        graph = g.build(globs, fdir, con=con)
-        graph["sources"] = _source_relations(con, srcs)
-        graph["revision"] = rev
         if os.environ.get("NEO4J_PASSWORD"):
             try:
-                g.load(graph, os.environ.get("NEO4J_URI", "bolt://localhost:7687"), "neo4j", os.environ["NEO4J_PASSWORD"])
+                g.load(graph, os.environ.get("NEO4J_URI", "bolt://localhost:7687"), "neo4j", os.environ["NEO4J_PASSWORD"],
+                       reset=grow["mode"] == "full")  # incremental revisions MERGE onto the existing graph
             except Exception as e:  # graph DB is a secondary view; the published snapshot is authoritative
                 print(f"neo4j load failed: {e}", flush=True)
-        _step(rid, "graph", "done", incidents=len(graph["incidents"]))
+        _step(rid, "graph", "done", incidents=len(graph["incidents"]),
+              note=f"+{grow['entities_new']} entities, +{grow['relationships_new']} relationships, "
+                   f"{grow['incidents_new']} new / {grow['incidents_grew']} grown incidents")
         _step(rid, "publish", "running")
         key = f"graph/ws={state.ws()}/rev-{rev}.json"
         g.write_snapshot(graph, f"s3://{_lake()}/{key}")

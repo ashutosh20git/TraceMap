@@ -23,7 +23,7 @@ function EntityNode({ data }: NodeProps) {
   else sub = "Device";
   return (
     <div
-      className={`gnode ${kind === "finding" ? `finding sev-b-${d.severity}` : ""} ${d.hub_degree ? "hub" : ""} ${data.dim ? "dim" : ""} ${data.selected ? "sel" : ""}`}
+      className={`gnode ${kind === "finding" ? `finding sev-b-${d.severity}` : ""} ${d.hub_degree ? "hub" : ""} ${data.dim ? "dim" : ""} ${data.selected ? "sel" : ""} ${data.fresh ? "fresh" : ""}`}
       title={`${NODE_LABEL[kind]}: ${g.label}`}
     >
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
@@ -104,7 +104,23 @@ function Legend() {
 
 type Props = { detail: IncidentDetail; highlighted: Set<string>; selection: Selection; onSelect: (s: Selection) => void };
 
-export default function GraphView({ detail, highlighted, selection, onSelect }: Props) {
+export default function GraphView({ detail: full, highlighted, selection, onSelect }: Props) {
+  // revision replay: show the graph as it was after each batch; things first seen in that revision are marked
+  const maxRev = useMemo(() => Math.max(1, ...full.nodes.map((n) => n.data.first_rev ?? 1)), [full]);
+  const [asOf, setAsOf] = useState(maxRev);
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => setAsOf(maxRev), [maxRev]);
+  useEffect(() => {
+    if (!playing) return;
+    const t = setInterval(() => setAsOf((r) => (r >= maxRev ? (setPlaying(false), r) : r + 1)), 1600);
+    return () => clearInterval(t);
+  }, [playing, maxRev]);
+  const detail = useMemo(() => {
+    const nodes = full.nodes.filter((n) => (n.data.first_rev ?? 1) <= asOf);
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = full.edges.filter((e) => ids.has(e.source) && ids.has(e.target) && (e.data.first_rev ?? 1) <= asOf);
+    return { ...full, nodes, edges };
+  }, [full, asOf]);
   const [layout, setLayout] = useState<{ pos: Record<string, Pt>; routes: Record<string, Pt[]> }>({ pos: {}, routes: {} });
   const [hover, setHover] = useState<string | null>(null);
   const col = useMemo(() => Object.fromEntries(detail.nodes.map((n) => [n.id, COLUMN[nodeKind(n)]])), [detail]);
@@ -165,9 +181,10 @@ export default function GraphView({ detail, highlighted, selection, onSelect }: 
         type: "entity",
         position: layout.pos[n.id] ?? { x: 0, y: 0 },
         draggable: false,
-        data: { g: n, dim: any && !highlighted.has(n.id), selected: selection?.kind === "node" && selection.id === n.id },
+        data: { g: n, dim: any && !highlighted.has(n.id), selected: selection?.kind === "node" && selection.id === n.id,
+                fresh: maxRev > 1 && (n.data.first_rev ?? 1) === asOf },
       })),
-    [detail, layout, highlighted, selection, any],
+    [detail, layout, highlighted, selection, any, asOf, maxRev],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -179,6 +196,7 @@ export default function GraphView({ detail, highlighted, selection, onSelect }: 
         const on = !any || (highlighted.has(e.source) && highlighted.has(e.target));
         const showLabel = isSel || hover === e.id || touchesSel;
         const related = k.startsWith("RELATED");
+        const fresh = maxRev > 1 && (e.data.first_rev ?? 1) === asOf;
         return {
           id: e.id,
           source: e.source,
@@ -190,6 +208,7 @@ export default function GraphView({ detail, highlighted, selection, onSelect }: 
           label: showLabel ? (k === "INVOLVES" ? e.label : e.label || st.label) : undefined,
           markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color: st.stroke },
           zIndex: related ? 2 : 1,
+          animated: fresh,
           style: {
             stroke: st.stroke,
             strokeDasharray: st.dash,
@@ -203,11 +222,23 @@ export default function GraphView({ detail, highlighted, selection, onSelect }: 
           labelBgBorderRadius: 3,
         };
       }),
-    [detail, highlighted, selection, any, hover, layout],
+    [detail, highlighted, selection, any, hover, layout, asOf, maxRev],
   );
 
   return (
     <div className="graphwrap">
+      {maxRev > 1 && (
+        <div className="revbar">
+          <span className="eyebrow">Revision</span>
+          <input id="rev-slider" type="range" min={1} max={maxRev} value={asOf} onChange={(e) => (setPlaying(false), setAsOf(+e.target.value))} aria-label="Show the graph as of revision" />
+          <span className="num"><b>{asOf}</b> of {maxRev}</span>
+          <button className="btn" onClick={() => (asOf >= maxRev && setAsOf(1), setPlaying(!playing))}>{playing ? "Pause" : "Replay growth"}</button>
+          <span className="muted small num">
+            {detail.nodes.length} nodes · {detail.edges.length} links ·{" "}
+            <span className="freshkey">{detail.nodes.filter((n) => (n.data.first_rev ?? 1) === asOf).length} new in this revision</span>
+          </span>
+        </div>
+      )}
       <Legend />
       <div className="flow">
         <ReactFlow
@@ -218,7 +249,7 @@ export default function GraphView({ detail, highlighted, selection, onSelect }: 
           fitView
           fitViewOptions={{ padding: 0.12, maxZoom: 1.1 }}
           minZoom={0.05}
-          key={detail.incident.id + Object.keys(layout.pos).length}
+          key={detail.incident.id + Object.keys(layout.pos).length + "-" + asOf}
           onNodeClick={(_, n) => onSelect({ kind: "node", id: n.id })}
           onEdgeClick={(_, e) => onSelect({ kind: "edge", id: e.id })}
           onEdgeMouseEnter={(_, e) => setHover(e.id)}

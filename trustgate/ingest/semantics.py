@@ -24,8 +24,12 @@ EVENT_IDS = {
     "4648": ("authentication", "login", None),
     "4720": ("account_management", "create", "success"),
     "4726": ("account_management", "delete", "success"),
-    "4728": ("account_management", "modify", "success"),
-    "4732": ("account_management", "modify", "success"),
+    "4728": ("account_management", "group_add", "success"),
+    "4732": ("account_management", "group_add", "success"),
+    "4756": ("account_management", "group_add", "success"),
+    "4740": ("account_management", "lockout", None),
+    "7036": ("system", "service_state", None),
+    "7045": ("system", "service_install", "success"),
     "4719": ("configuration", "disable_logging", None),
     "1102": ("configuration", "clear_logs", "success"),
     "104": ("configuration", "clear_logs", "success"),
@@ -41,6 +45,9 @@ TEXT_RULES = [  # (pattern, category, activity, outcome)
     (_P(r"(log|audit)\w*.{0,40}(changed from .?disable.? to .?enable|re-?enabled)"), "configuration", "enable_logging", "success"),
     (_P(r"(audit )?log\w* (was )?cleared|clear(ed)? (the )?(event|security) log"), "configuration", "clear_logs", "success"),
     (_P(r"(polic(y|ies)|rules?|ruleset).{0,30}(purged|flushed|deleted|removed)"), "configuration", "delete_policy", "success"),
+    (_P(r"(added|add|member).{0,40}(to|into|of).{0,30}(administrators|domain admins|enterprise admins|admin group|super_?admin|sudoers|wheel)"), "account_management", "group_add", "success"),
+    (_P(r"service.{0,60}(entered the stopped state|was stopped|stopped)"), "system", "service_stop", "success"),
+    (_P(r"(a )?(new )?service was installed|service installed"), "system", "service_install", "success"),
     (_P(r"^delete system\.admin|\b(delete|deleted|removed|userdel)\b.{0,25}\b(admin|user|account)\b"), "account_management", "delete", "success"),
     (_P(r"^add system\.admin|\b(add|create|created|added|new)\b.{0,25}\b(admin|user|account)\b|\buseradd\b"), "account_management", "create", "success"),
     (_P(r"(failed|failure|invalid|incorrect|bad).{0,40}(login|log ?in|logon|password|authenticat)|authentication failure|login failed"), "authentication", "login", "failure"),
@@ -87,7 +94,7 @@ def classify(code, etype, esub, action, outcome_raw, message) -> tuple[str, str 
     if code and str(code).strip() in EVENT_IDS:
         cat, act, out = EVENT_IDS[str(code).strip()]
     text = " ".join(x for x in (message, action) if x)
-    if text and (cat is None or cat in ("configuration", "network") or act is None):
+    if text and (cat is None or cat in ("configuration", "network", "system") or act is None):
         for pat, c, a, o in TEXT_RULES:
             if pat.search(text):
                 # a specific text meaning refines a generic id meaning (e.g. config change -> log disabled)

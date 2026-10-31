@@ -4,6 +4,73 @@ import { Run, RunStep, Source, SOURCE_STATUS, useRun, useSources } from "./works
 
 type SnapSource = { source_id: string; filename: string; events?: number; first?: string; last?: string; related: { source_id: string; filename: string; reason: string }[] };
 
+type Growth = { revision: number; at: string; mode: string; files_added: string[]; events_added: number; entities: number; entities_new: number;
+  relationships: number; relationships_new: number; detections: number; detections_new: number; incidents: number; incidents_new: number; incidents_grew: number };
+
+/** How the case's knowledge base grew with each processed batch. */
+function GrowthPanel() {
+  const s = useQuery({ queryKey: ["summary"], queryFn: api.summary });
+  const g = ((s.data as any)?.growth ?? []) as Growth[];
+  if (!g.length) return null;
+  const max = Math.max(...g.map((r) => r.entities + r.relationships), 1);
+  const W = 560, H = 120, bw = Math.min(70, (W - 40) / g.length - 12);
+  return (
+    <section className="panel">
+      <div className="pad" style={{ borderBottom: "1px solid var(--line)" }}>
+        <div className="eyebrow">How the knowledge base grew</div>
+        <p className="muted small" style={{ margin: "4px 0 0" }}>
+          Each processed batch is joined to what was already known: its addresses and accounts merge onto existing nodes, open
+          detections continue across the file boundary, and incidents grow instead of starting over.
+        </p>
+      </div>
+      <div className="pad growth">
+        <svg viewBox={`0 0 ${W} ${H + 24}`} width="100%" style={{ maxWidth: W }} role="img" aria-label="Graph size per revision">
+          {g.map((r, i) => {
+            const x = 30 + i * (bw + 12);
+            const he = (r.entities / max) * H, hr = (r.relationships / max) * H;
+            const hn = ((r.entities_new + r.relationships_new) / max) * H;
+            return (
+              <g key={r.revision}>
+                <rect x={x} y={H - he - hr} width={bw} height={hr} fill="var(--sunken)" stroke="var(--line)" />
+                <rect x={x} y={H - he} width={bw} height={he} fill="var(--line)" />
+                <rect x={x + bw - 6} y={H - hn} width={6} height={hn} fill="var(--accent)" />
+                <text x={x + bw / 2} y={H + 16} textAnchor="middle" fontSize="11" fill="var(--muted)">rev {r.revision}</text>
+                <text x={x + bw / 2} y={H - he - hr - 4} textAnchor="middle" fontSize="10.5" fill="var(--ink)">{r.entities + r.relationships}</text>
+              </g>
+            );
+          })}
+        </svg>
+        <div className="small muted" style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+          <span><span className="swatch" style={{ background: "var(--line)" }} /> entities</span>
+          <span><span className="swatch" style={{ background: "var(--sunken)", border: "1px solid var(--line)" }} /> relationships</span>
+          <span><span className="swatch" style={{ background: "var(--accent)" }} /> added in that revision</span>
+        </div>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table className="gtable num">
+          <thead>
+            <tr><th>Rev</th><th>File added</th><th>Events</th><th>Entities</th><th>Relationships</th><th>Detections</th><th>Incidents</th><th>Mode</th></tr>
+          </thead>
+          <tbody>
+            {g.map((r) => (
+              <tr key={r.revision}>
+                <td>{r.revision}</td>
+                <td className="mono">{r.files_added.join(", ") || "re-analysis"}</td>
+                <td>{r.events_added.toLocaleString()}</td>
+                <td>{r.entities.toLocaleString()} <span className="plus">+{r.entities_new}</span></td>
+                <td>{r.relationships.toLocaleString()} <span className="plus">+{r.relationships_new}</span></td>
+                <td>{r.detections.toLocaleString()} <span className="plus">+{r.detections_new}</span></td>
+                <td>{r.incidents} <span className="plus">+{r.incidents_new} new{r.incidents_grew ? `, ${r.incidents_grew} grew` : ""}</span></td>
+                <td className="muted">{r.mode}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 function Relations() {
   const s = useQuery({ queryKey: ["summary"], queryFn: api.summary });
   const srcs = ((s.data as any)?.sources ?? []) as SnapSource[];
@@ -215,6 +282,7 @@ export default function ChecksPage({ onOpenBoard, published }: { onOpenBoard: ()
         </button>
       </div>
       {run.data ? <RunPanel run={run.data} /> : <div className="panel empty">No processing run yet. Upload files and start processing in step 1.</div>}
+      <GrowthPanel />
       <Relations />
       {shown.map((s) => (
         <SourceChecks key={s.source_id} s={s} />
